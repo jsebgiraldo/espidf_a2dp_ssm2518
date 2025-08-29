@@ -58,16 +58,13 @@ void tlv320_diagnose_and_fix_dropout_issues(void);
 // Forces correct mixer routing when DAC->HP path is broken
 bool tlv320_emergency_mixer_fix(void);
 
-// 🔧 CRITICAL: Force correct clock configuration for BCLK=64×Fs
-// Call this after ESP32 I2S is generating BCLK with 32-bit slots
-// Overwrites previous clock config with mathematically correct values
-void tlv_force_clock_for_64fs(void);
+// Clocks are configured via tlv320_configure_bclk_i2s_16() for 32×Fs BCLK-only mode
 
 // ========== CLOCK VERIFICATION ==========
 // Verify clock math for debugging - call after I2S config
 void tlv320_verify_clock_math(int sample_rate, bool is_32bit_slots);
 
-// Read and verify registers after forcing 64×Fs configuration
+// Read and verify registers after configuring clocks
 void tlv320_readback_clock(int sample_rate);
 
 // Dump current TLV320 clock configuration registers

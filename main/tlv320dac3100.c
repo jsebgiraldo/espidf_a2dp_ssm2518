@@ -185,14 +185,13 @@ static bool tlv_write_ok(uint8_t page, uint8_t reg, uint8_t val)
 
 bool tlv320_configure_bclk_i2s_16(int sample_rate)
 {
-    // 🔧 CONFIGURACIÓN CORREGIDA para BCLK = 64×Fs (slots 32-bit)
-    // Aritmética del PLL actualizada para compensar el nuevo BCLK
+    // 🔧 Configuración para BCLK = 32×Fs (slots 16-bit)
     if (!(sample_rate == 44100 || sample_rate == 48000)) {
         ESP_LOGE(TAG, "Unsupported SR %d for BCLK mode (use 44100 or 48000)", sample_rate);
         return false;
     }
 
-    ESP_LOGI(TAG, "🔧 Configurando TLV320 para BCLK=64×Fs (%d Hz), SR=%d", 64 * sample_rate, sample_rate);
+    ESP_LOGI(TAG, "🔧 Configurando TLV320 para BCLK=32×Fs (%d Hz), SR=%d", 32 * sample_rate, sample_rate);
 
     // 1. Soft reset y esperar estabilización
     if (!tlv_write_ok(0x00, 0x01, 0x01)) {
@@ -206,27 +205,27 @@ bool tlv320_configure_bclk_i2s_16(int sample_rate)
     if (!tlv_write_ok(0x00, 0x1C, 0x00)) return false; // data offset = 0
     if (!tlv_write_ok(0x00, 0x1D, 0x01)) return false; // BCLK/WCLK inputs
 
-    // 3. ⚡ CORRECCIÓN CRÍTICA: BCLK→PLL con referencia correcta
+    // 3. ⚡ BCLK→PLL con referencia correcta
     if (!tlv_write_ok(0x00, 0x04, 0x07)) return false; // PLL ref = BCLK, CODEC_CLKIN = PLL
 
-    // 4. 🎯 PLL Programming CORREGIDO para BCLK=64×Fs: P=1, R=1, J=32, D=0
-    if (!tlv_write_ok(0x00, 0x05, 0x91)) return false; // P=1, R=1 (CORREGIDO desde R=2), PLL powered
-    if (!tlv_write_ok(0x00, 0x06, 0x20)) return false; // J=32 (CORREGIDO desde J=8)
+    // 4. 🎯 PLL Programming para BCLK=32×Fs: P=1, R=1, J=32, D=0
+    if (!tlv_write_ok(0x00, 0x05, 0x91)) return false; // P=1, R=1, PLL powered
+    if (!tlv_write_ok(0x00, 0x06, 0x20)) return false; // J=32
     if (!tlv_write_ok(0x00, 0x07, 0x00)) return false; // D MSB = 0
     if (!tlv_write_ok(0x00, 0x08, 0x00)) return false; // D LSB = 0
     
     vTaskDelay(pdMS_TO_TICKS(10)); // Wait for PLL lock
 
-    // 5. ⚙️ Clock dividers OPTIMIZADOS para BCLK=64×Fs
+    // 5. ⚙️ Clock dividers para BCLK=32×Fs
     if (!tlv_write_ok(0x00, 0x0B, 0x88)) return false; // NDAC=8, powered
-    if (!tlv_write_ok(0x00, 0x0C, 0x82)) return false; // MDAC=2, powered  
+    if (!tlv_write_ok(0x00, 0x0C, 0x81)) return false; // MDAC=1, powered  
     if (!tlv_write_ok(0x00, 0x0D, 0x00)) return false; // DOSR MSB = 0
     if (!tlv_write_ok(0x00, 0x0E, 0x80)) return false; // DOSR LSB = 128
 
     // 📊 Clock path math verification:
-    // BCLK = 64×Fs, PLL = BCLK×32/1 = 64×32×Fs = 2048×Fs
-    // DAC_CLK = PLL/(NDAC×MDAC×DOSR) = 2048×Fs/(8×2×128) = 2048×Fs/2048 = Fs ✓
-    ESP_LOGI(TAG, "🎯 Clock path: BCLK(%d)×32→PLL→÷2048→DAC_CLK(%d Hz)", 64 * sample_rate, sample_rate);
+    // BCLK = 32×Fs, PLL = BCLK×32/1 = 32×32×Fs = 1024×Fs
+    // DAC_CLK = PLL/(NDAC×MDAC×DOSR) = 1024×Fs/(8×1×128) = 1024×Fs/1024 = Fs ✓
+    ESP_LOGI(TAG, "🎯 Clock path: BCLK(%d)×32→PLL→÷1024→DAC_CLK(%d Hz)", 32 * sample_rate, sample_rate);
 
     // 6. Processing block
     if (!tlv_write_ok(0x00, 0x3C, 0x01)) return false; // PRB_P1
@@ -238,15 +237,15 @@ bool tlv320_configure_bclk_i2s_16(int sample_rate)
     if (!tlv_write_ok(0x00, 0x42, 0x00)) return false; // Right DAC 0dB
 
     // 📊 VERIFICACIÓN MATEMÁTICA COMPLETA del clock path
-    uint32_t bclk_hz = 64 * sample_rate;  // BCLK con slots 32-bit
+    uint32_t bclk_hz = 32 * sample_rate;  // BCLK con slots 16-bit
     uint32_t pll_hz = bclk_hz * 32;       // PLL = BCLK × J / R = BCLK × 32 / 1
-    uint32_t dac_clk_hz = pll_hz / (8 * 2 * 128); // DAC_CLK = PLL / (NDAC × MDAC × DOSR)
+    uint32_t dac_clk_hz = pll_hz / (8 * 1 * 128); // DAC_CLK = PLL / (NDAC × MDAC × DOSR)
     
     ESP_LOGI(TAG, "📊 VERIFICACIÓN CLOCK PATH:");
     ESP_LOGI(TAG, "   🎵 Sample Rate: %d Hz", sample_rate);
-    ESP_LOGI(TAG, "   📡 BCLK (64×Fs): %lu Hz", (unsigned long)bclk_hz);
+    ESP_LOGI(TAG, "   📡 BCLK (32×Fs): %lu Hz", (unsigned long)bclk_hz);
     ESP_LOGI(TAG, "   ⚡ PLL (BCLK×32): %lu Hz", (unsigned long)pll_hz);
-    ESP_LOGI(TAG, "   🎯 DAC_CLK (PLL÷2048): %lu Hz", (unsigned long)dac_clk_hz);
+    ESP_LOGI(TAG, "   🎯 DAC_CLK (PLL÷1024): %lu Hz", (unsigned long)dac_clk_hz);
     ESP_LOGI(TAG, "   ✅ Match: %s", (dac_clk_hz == sample_rate) ? "PERFECTO" : "❌ ERROR");
     
     if (dac_clk_hz != sample_rate) {
@@ -256,7 +255,7 @@ bool tlv320_configure_bclk_i2s_16(int sample_rate)
         return false;
     }
 
-    ESP_LOGI(TAG, "✅ TLV320 clock tree CORREGIDO y verificado para BCLK=64×Fs");
+    ESP_LOGI(TAG, "✅ TLV320 clock tree configurado y verificado para BCLK=32×Fs");
     return true;
 }
 
@@ -399,9 +398,7 @@ bool tlv320_hardware_reset_and_init(int sample_rate)
         return false;
     }
     
-    // 🔧 FORZAR configuración correcta 64×Fs (R=1)
-    ESP_LOGI(TAG, "🔧 Aplicando configuración FORZADA 64×Fs después del reset...");
-    tlv_force_clock_for_64fs();
+    // Nota: No se fuerza 64×Fs; clocks ya corresponden a 32×Fs I2S
     
     // Verificar configuración con readback
     vTaskDelay(pdMS_TO_TICKS(10));  // Esperar estabilización
@@ -557,7 +554,7 @@ bool tlv320_configure_headphone_only(void)
 {
     ESP_LOGI(TAG, "=== CONFIGURACIÓN TLV320DAC3100 HeadphoneOutput (SOLO ANALÓGICA) ===");
     ESP_LOGI(TAG, "🔧 IMPORTANTE: Esta función NO toca clocks - solo configuración analógica");
-    ESP_LOGI(TAG, "⚡ Los clocks deben estar configurados previamente por tlv_force_clock_for_64fs()");
+    ESP_LOGI(TAG, "⚡ Los clocks deben estar configurados previamente por tlv320_configure_bclk_i2s_16()");
     
     // ========== PAGE 0: SOLO CONFIGURACIÓN DAC DIGITAL (sin clocks) ==========
     if (!tlv_write_ok(0x00, 0x00, 0x00)) {
@@ -703,7 +700,7 @@ bool tlv320_configure_headphone_only(void)
     ESP_LOGI(TAG, "   • Routing: P1/R35=0x44 (DAC_L→HPL, DAC_R→HPR)");
     ESP_LOGI(TAG, "   • HP PGAs: P1/R40=0x06, P1/R41=0x06 (UNMUTED)");
     ESP_LOGI(TAG, "   • Mixers: P1/0x0C=0x08, P1/0x0D=0x08 (DAC→HP)");
-    ESP_LOGI(TAG, "⚡ CLOCKS: Configurados externamente por tlv_force_clock_for_64fs()");
+    ESP_LOGI(TAG, "⚡ CLOCKS: Configurados previamente por tlv320_configure_bclk_i2s_16()");
     ESP_LOGI(TAG, "🎧 AUDIO DEBE FUNCIONAR CORRECTAMENTE EN HEADPHONES HPL/HPR");
     
     tlv320_dump_debug();
@@ -977,59 +974,7 @@ void tlv320_diagnose_and_fix_dropout_issues(void)
     ESP_LOGI(TAG, "=== DROPOUT DIAGNOSIS COMPLETE ===");
 }
 
-// 🔧 FUNCIÓN CRÍTICA: Forzar configuración 64×Fs según análisis del usuario
-void tlv_force_clock_for_64fs(void) {
-    ESP_LOGI(TAG, "🔧 === FORZANDO CONFIGURACIÓN CLOCK PARA 64×Fs ===");
-    ESP_LOGI(TAG, "🎯 Aplicando configuración matemáticamente correcta para BCLK=64×Fs");
-    
-    // PLL from BCLK, CODEC_CLKIN=PLL
-    tlv_write_ok(0x00, 0x04, 0x07);
-    ESP_LOGI(TAG, "   P0/0x04 = 0x07 → ref PLL = BCLK y CODEC_CLKIN = PLL");
-    
-    // PLL on, P=1, R=1 (¡CRÍTICO: R=1, no R=2!)
-    tlv_write_ok(0x00, 0x05, 0x91);
-    ESP_LOGI(TAG, "   P0/0x05 = 0x91 → PLL ON, P=1, R=1 (¡no R=2!)");
-    
-    // J=32, D=0
-    tlv_write_ok(0x00, 0x06, 0x20);
-    tlv_write_ok(0x00, 0x07, 0x00);
-    tlv_write_ok(0x00, 0x08, 0x00);
-    ESP_LOGI(TAG, "   P0/0x06 = 0x20 → J=32");
-    ESP_LOGI(TAG, "   P0/0x07 = 0x00, 0x08 = 0x00 → D=0");
-    
-    vTaskDelay(pdMS_TO_TICKS(10)); // lock
-
-    // NDAC/MDAC/DOSR para 64×Fs
-    tlv_write_ok(0x00, 0x0B, 0x88);
-    tlv_write_ok(0x00, 0x0C, 0x82);
-    tlv_write_ok(0x00, 0x0D, 0x00);
-    tlv_write_ok(0x00, 0x0E, 0x80);
-    ESP_LOGI(TAG, "   P0/0x0B = 0x88, 0x0C = 0x82, 0x0D = 0x00, 0x0E = 0x80 → NDAC=8, MDAC=2, DOSR=128");
-
-    // I2S 16-bit, slave mode
-    tlv_write_ok(0x00, 0x1B, 0x00);
-    // 🔧 AJUSTE FINO: Offset de 1 bit para algunos AIC3xxx que lo prefieren
-    // Cambiar a 0x01 si el audio sigue con problemas tras arreglar BCLK
-    tlv_write_ok(0x00, 0x1C, 0x00);  // data offset = 0 (cambiar a 0x01 si hace falta)
-    tlv_write_ok(0x00, 0x1D, 0x01);
-
-    // PRB y DAC on/unmute (volúmenes con -3dB para evitar clipping)
-    tlv_write_ok(0x00, 0x3C, 0x01);
-    tlv_write_ok(0x00, 0x41, 0x06); // LDAC -3 dB (cada 0x01 = -0.5 dB)
-    tlv_write_ok(0x00, 0x42, 0x06); // RDAC -3 dB
-    tlv_write_ok(0x00, 0x3F, 0xD4);
-    tlv_write_ok(0x00, 0x40, 0x00);
-    
-    // Configurar HP PGAs con -3 dB para evitar saturación
-    tlv_write_ok(0x01, 0x28, 0x05); // HPL PGA -3 dB (0x06 ≈ 0 dB, 0x05 ≈ -3 dB)
-    tlv_write_ok(0x01, 0x29, 0x05); // HPR PGA -3 dB
-    
-    ESP_LOGI(TAG, "📊 MATEMÁTICA VERIFICADA:");
-    ESP_LOGI(TAG, "   a 48k: BCLK=3.072 MHz → PLL=98.304 MHz → Fs=98.304e6/(8·2·128)=48k ✅");
-    ESP_LOGI(TAG, "   a 44.1k: BCLK=2.8224 MHz → PLL=90.3168 MHz → Fs=44.1k ✅");
-    ESP_LOGI(TAG, "🔧 Volúmenes: DAC -3dB, HP PGA -3dB para prevenir clipping");
-    ESP_LOGI(TAG, "✅ CONFIGURACIÓN 64×Fs FORZADA COMPLETADA");
-}
+// (El modo de forzado 64×Fs ha sido retirado; usamos 32×Fs coherente con I2S)
 
 bool tlv320_emergency_mixer_fix(void)
 {
@@ -1084,12 +1029,12 @@ bool tlv320_emergency_mixer_fix(void)
     return overall_success;
 }
 
-// Función para readback y verificación después de forzar configuración 64×Fs
+// Función para readback y verificación de configuración de clocks actual
 void tlv320_readback_clock(int sample_rate)
 {
     uint8_t clk_src, pll_reg, j_reg, ndac_reg, mdac_reg, dosr_h, dosr_l;
     
-    ESP_LOGI(TAG, "🔍 === READBACK CLOCK DESPUÉS DE FORZAR 64×Fs ===");
+    ESP_LOGI(TAG, "🔍 === READBACK CLOCK (estado actual) ===");
     
     // Leer configuración actual
     bool read_ok = true;
@@ -1123,14 +1068,14 @@ void tlv320_readback_clock(int sample_rate)
     ESP_LOGI(TAG, "   P0/0x0C=0x%02X → MDAC=%d", mdac_reg, MDAC);
     ESP_LOGI(TAG, "   P0/0x0D-0E=0x%04X → DOSR=%d", (dosr_h << 8) | dosr_l, DOSR);
     
-    // Verificar configuración esperada para 64×Fs
+    // Verificar configuración esperada para 32×Fs
     bool config_ok = true;
     if (clk_src != 0x07) {
         ESP_LOGW(TAG, "⚠️ Clock source incorrecto: 0x%02X (esperado 0x07)", clk_src);
         config_ok = false;
     }
-    if (pll_reg != 0x91) {
-        ESP_LOGW(TAG, "⚠️ PLL config incorrecto: 0x%02X (esperado 0x91)", pll_reg);
+    if ((pll_reg & 0x8F) != 0x81) { // ON + R=1, P=1 (esperado P=1,R=1)
+        ESP_LOGW(TAG, "⚠️ PLL config inesperado: 0x%02X (esperado 0x91)", pll_reg);
         config_ok = false;
     }
     if (j_reg != 0x20) {
@@ -1140,7 +1085,7 @@ void tlv320_readback_clock(int sample_rate)
     
     // Cálculo matemático correcto
     if (P != 0 && R != 0 && J != 0 && NDAC != 0 && MDAC != 0 && DOSR != 0) {
-        uint32_t bclk_hz = 64 * sample_rate;  // BCLK = 64×Fs
+    uint32_t bclk_hz = 32 * sample_rate;  // BCLK = 32×Fs
         uint32_t pll_hz = (bclk_hz * J) / (P * R);
         uint32_t dac_clk_hz = pll_hz / (NDAC * MDAC * DOSR);
         
@@ -1158,7 +1103,7 @@ void tlv320_readback_clock(int sample_rate)
     }
     
     if (config_ok) {
-        ESP_LOGI(TAG, "✅ Configuración 64×Fs VERIFICADA - NO aplicar emergency fixes");
+        ESP_LOGI(TAG, "✅ Configuración de clocks verificada - NO aplicar emergency fixes");
     } else {
         ESP_LOGE(TAG, "❌ Configuración incorrecta después de forzar - investigar");
     }
@@ -1220,7 +1165,7 @@ void tlv320_verify_clock_math(int sample_rate, bool is_32bit_slots)
     
     ESP_LOGI(TAG, "📊 CÁLCULO CON VALORES REALES:");
     ESP_LOGI(TAG, "   📡 BCLK: %lu Hz", (unsigned long)bclk_hz);
-    ESP_LOGI(TAG, "   ⚡ PLL (BCLK×%d÷%d): %lu Hz", J, R, (unsigned long)pll_hz);
+    ESP_LOGI(TAG, "   ⚡ PLL (BCLK×%d÷(P=%d·R=%d)): %lu Hz", J, P, R, (unsigned long)pll_hz);
     ESP_LOGI(TAG, "   🎯 DAC_CLK (PLL÷%d): %lu Hz", NDAC * MDAC * DOSR, (unsigned long)dac_clk_hz);
     
     // Verificación honesta
@@ -1234,8 +1179,8 @@ void tlv320_verify_clock_math(int sample_rate, bool is_32bit_slots)
         
         // Diagnóstico del problema
         if (R == 2 && is_32bit_slots) {
-            ESP_LOGE(TAG, "   🚨 PROBLEMA DETECTADO: R=2 con BCLK=64×Fs");
-            ESP_LOGE(TAG, "   🚨 SOLUCIÓN: Usar R=1 (0x91) en lugar de R=2 (0x92)");
+            ESP_LOGE(TAG, "   🚨 PROBLEMA DETECTADO: R=2 (histórico)");
+            ESP_LOGE(TAG, "   🚨 SOLUCIÓN: Usar R=1 (0x91). Con 32×Fs usamos J=32, P=1, R=1");
         }
     }
 }

@@ -34,6 +34,13 @@
 // TLV320DAC3100 driver (scaffold)
 #include "tlv320dac3100.h"
 
+// Tamaños de buffers y agua para suavizar jitter
+#ifndef PCM_RB_SIZE_BYTES
+#define PCM_RB_SIZE_BYTES   (32 * 1024)  // 32 KB para mayor colchón
+#endif
+#define PCM_LOW_WATER_BYTES  (12 * 1024)  // 12 KB
+#define PCM_HIGH_WATER_BYTES (28 * 1024)  // 28 KB
+
 // --------- Configuración de pines ---------
 // I2C
 #define I2C_MASTER_NUM           I2C_NUM_0
@@ -46,91 +53,8 @@
 #define TLV320_RESET_IO          33
 #endif
 
-// ========== CONFIGURACIÓN NVS PARA RUNTIME TESTING ==========
-
+// Tag de logs
 static const char *TAG = "MAIN";
-
-typedef struct {
-    bool bclk_invert;
-    bool ws_invert;
-    uint32_t test_mode;  // 0=normal, 1=test pattern, 2=debug tones
-} i2s_test_config_t;
-
-// Leer configuración de test desde NVS
-esp_err_t load_i2s_test_config(i2s_test_config_t *config)
-{
-    nvs_handle nvs_handle;
-    esp_err_t err;
-    
-    // Valores por defecto
-    config->bclk_invert = false;
-    config->ws_invert = false;
-    config->test_mode = 0;
-    
-    err = nvs_open("i2s_test", NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "No se puede abrir NVS i2s_test (primera vez): %s", esp_err_to_name(err));
-        return ESP_OK;  // Usar defaults
-    }
-    
-    size_t required_size = sizeof(i2s_test_config_t);
-    err = nvs_get_blob(nvs_handle, "config", config, &required_size);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "📋 Configuración I2S cargada desde NVS:");
-        ESP_LOGI(TAG, "   BCLK invert: %s", config->bclk_invert ? "YES" : "NO");
-        ESP_LOGI(TAG, "   WS invert: %s", config->ws_invert ? "YES" : "NO");
-        ESP_LOGI(TAG, "   Test mode: %lu", (unsigned long)config->test_mode);
-    } else {
-        ESP_LOGW(TAG, "No se puede leer config desde NVS: %s", esp_err_to_name(err));
-    }
-    
-    nvs_close(nvs_handle);
-    return ESP_OK;
-}
-
-// Guardar configuración de test en NVS
-esp_err_t save_i2s_test_config(const i2s_test_config_t *config)
-{
-    nvs_handle nvs_handle;
-    esp_err_t err;
-    
-    err = nvs_open("i2s_test", NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error abriendo NVS para escritura: %s", esp_err_to_name(err));
-        return err;
-    }
-    
-    err = nvs_set_blob(nvs_handle, "config", config, sizeof(i2s_test_config_t));
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "✅ Configuración I2S guardada en NVS");
-        }
-    }
-    
-    nvs_close(nvs_handle);
-    return err;
-}
-
-// Función para cambiar configuración I2S desde consola/log
-esp_err_t set_i2s_test_mode(bool bclk_inv, bool ws_inv, uint32_t test_mode)
-{
-    i2s_test_config_t config = {
-        .bclk_invert = bclk_inv,
-        .ws_invert = ws_inv,
-        .test_mode = test_mode
-    };
-    
-    esp_err_t err = save_i2s_test_config(&config);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "🔄 Nueva configuración I2S guardada. Reinicie para aplicar:");
-        ESP_LOGI(TAG, "   BCLK invert: %s", bclk_inv ? "YES" : "NO");
-        ESP_LOGI(TAG, "   WS invert: %s", ws_inv ? "YES" : "NO");
-        ESP_LOGI(TAG, "   Test mode: %lu", (unsigned long)test_mode);
-    }
-    
-    return err;
-}
 
 // ========== I2S INIT ==========
 // Configuración optimizada para usar BCLK como fuente de reloj del TLV320
@@ -139,19 +63,7 @@ esp_err_t set_i2s_test_mode(bool bclk_inv, bool ws_inv, uint32_t test_mode)
 #define I2S_DOUT_IO              27   // SDATA hacia codec
 #define I2S_MCLK_IO              -1   // MCLK deshabilitado - modo BCLK optimizado
 
-// Inversiones opcionales por si hay desalineación de flancos
-// 🔧 AJUSTES PARA PROBAR SI HAY "RASPADO" POR FLANCOS INCORRECTOS
-// Prueba estas combinaciones si el audio suena "raspado":
-// Opción 1: Solo BCLK invertido (más común para grano digital)
-#ifndef I2S_BCLK_INVERT
-#define I2S_BCLK_INVERT          false  // Cambiar a true si hay grano digital
-#endif
-// Opción 2: Solo WS invertido (menos común)
-#ifndef I2S_WS_INVERT
-#define I2S_WS_INVERT            false  // Cambiar a true si BCLK_INVERT no ayuda
-#endif
-// IMPORTANTE: No dejes ambas invertidas a la vez salvo que lo verifiques
-// Lo típico cuando hay "grano digital" por borde es que invertir BCLK lo cura al instante
+// Inversiones: fijado a polaridad normal (BCLK y WS no invertidos)
 
 // I2S handle
 static i2s_chan_handle_t s_tx_chan = NULL;
@@ -159,7 +71,7 @@ static uint32_t s_current_sample_rate = 44100; // valor por defecto
 static SemaphoreHandle_t s_i2s_mutex;
 static RingbufHandle_t s_pcm_rb = NULL;
 static TaskHandle_t s_i2s_writer_task = NULL;
-static uint8_t s_silence[1024] = {0};
+static uint8_t s_silence[2048] = {0};
 static volatile size_t s_rx_bytes = 0;
 static volatile size_t s_tx_bytes = 0;
 static TaskHandle_t s_audio_stats_task = NULL;
@@ -268,19 +180,15 @@ static void i2s_init(uint32_t sample_rate)
 {
     s_current_sample_rate = sample_rate;
 
-    // Cargar configuración de test desde NVS
-    i2s_test_config_t test_config;
-    load_i2s_test_config(&test_config);
-
     i2s_chan_config_t chan_cfg;
     memset(&chan_cfg, 0, sizeof(chan_cfg));
     chan_cfg.id = I2S_NUM_0;
     chan_cfg.role = I2S_ROLE_MASTER;
-    // Buffers al perfil estable del main anterior
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 256;
+    // 1) DMA más profundo (≈ 24 KB en anillo DMA): 12 desc × 2048 B/desc
+    chan_cfg.dma_desc_num = 12;     // antes 8
+    chan_cfg.dma_frame_num = 256;   // antes 256 → 512 frames * 4 B/frame = 2048 B por desc (16b estéreo)
     chan_cfg.auto_clear = true;
-    chan_cfg.intr_priority = 0;
+    chan_cfg.intr_priority = 2;     // eleva prioridad de la ISR del I2S
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL));
 
     // Philips, 16-bit de datos y 16-bit por slot → BCLK = 32×Fs
@@ -292,8 +200,7 @@ static void i2s_init(uint32_t sample_rate)
     // Nota: left_align, big_endian, bit_order_lsb no existen en ESP-IDF 5.4.1
     // Estos se configuran automáticamente en el modo Philips estándar
     
-    ESP_LOGI(TAG, "🔧 I2S Slot config: 32-bit slots, bit_shift=true, Philips mode, WS_invert=%s", 
-             test_config.ws_invert ? "YES" : "NO");
+    ESP_LOGI(TAG, "🔧 I2S Slot config: 16-bit slots, bit_shift=true, Philips mode");
     
     i2s_std_config_t std_cfg;
     memset(&std_cfg, 0, sizeof(std_cfg));
@@ -307,12 +214,9 @@ static void i2s_init(uint32_t sample_rate)
     std_cfg.gpio_cfg.dout = I2S_DOUT_IO;
     std_cfg.gpio_cfg.din  = I2S_GPIO_UNUSED;
     std_cfg.gpio_cfg.invert_flags.mclk_inv = false;
-    std_cfg.gpio_cfg.invert_flags.bclk_inv = test_config.bclk_invert;  // BCLK invert from NVS
-    std_cfg.gpio_cfg.invert_flags.ws_inv   = test_config.ws_invert;    // WS invert from NVS
-    
-    ESP_LOGI(TAG, "🔧 I2S Inversiones: BCLK=%s, WS=%s", 
-             test_config.bclk_invert ? "INVERTED" : "NORMAL",
-             test_config.ws_invert ? "INVERTED" : "NORMAL");
+    std_cfg.gpio_cfg.invert_flags.bclk_inv = false;
+    std_cfg.gpio_cfg.invert_flags.ws_inv   = false;
+    ESP_LOGI(TAG, "🔧 I2S Inversiones: BCLK=NORMAL, WS=NORMAL");
     
     // APLL se queda
     std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
@@ -321,10 +225,15 @@ static void i2s_init(uint32_t sample_rate)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
 
-    // Ring buffer al tamaño del main anterior (~60 ms @48k/16b estéreo)
+    // Ajuste de drive strength para mejorar integridad de señal en BCLK/WS/DOUT
+    (void)gpio_set_drive_capability((gpio_num_t)I2S_BCLK_IO, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_drive_capability((gpio_num_t)I2S_LRCK_IO, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_drive_capability((gpio_num_t)I2S_DOUT_IO,  GPIO_DRIVE_CAP_3);
+
+    // Ring buffer unificado (B1): 32 KB para mayor holgura en ráfagas A2DP
     if (s_pcm_rb == NULL) {
-        s_pcm_rb = xRingbufferCreate(12 * 1024, RINGBUF_TYPE_BYTEBUF);
-        ESP_LOGI(TAG, "📦 Ring buffer: 12 KB (perfil estable 32×Fs)");
+        s_pcm_rb = xRingbufferCreate(PCM_RB_SIZE_BYTES, RINGBUF_TYPE_BYTEBUF);
+        ESP_LOGI(TAG, "📦 Ring buffer: %u KB (unificado, 32×Fs)", (unsigned)(PCM_RB_SIZE_BYTES/1024));
     }
 
     // Logging: 32×Fs
@@ -338,12 +247,7 @@ static void i2s_init(uint32_t sample_rate)
         s_i2s_mutex = xSemaphoreCreateMutex();
     }
 
-    // 🔄 OPTIMIZACIÓN: Ring buffer GRANDE para compensar drift sin MCLK
-    if (s_pcm_rb == NULL) {
-        // 32 KB de buffer (~170ms a 48kHz 16-bit estéreo) para estabilidad
-        s_pcm_rb = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
-        ESP_LOGI(TAG, "📦 Ring buffer: 32 KB para drift control en modo BCLK");
-    }
+    // Nota: No se crea un segundo buffer; tamaño unificado arriba
 }
 
 static void audio_stats_task(void *arg)
@@ -430,21 +334,55 @@ static size_t i2s_write_pcm(const uint8_t *data, size_t len, uint32_t timeout_ms
 
 static void i2s_writer_task(void *arg)
 {
-    const TickType_t recv_timeout = pdMS_TO_TICKS(20);
+    // B2: Escritor DMA-alineado a bloques fijos de 2048 bytes
+    const size_t BLK = 2048;          // antes 1024
+    uint8_t blk_buf[2048];
+    size_t fill = 0;
+    const TickType_t recv_timeout = pdMS_TO_TICKS(10);
+    static bool started = false;
+
     for (;;) {
-        size_t item_size = 0;
-        uint8_t *chunk = (uint8_t *)xRingbufferReceive(s_pcm_rb, &item_size, recv_timeout);
-        if (chunk && item_size) {
-            // Escribir el bloque recibido a I2S
-            (void)i2s_write_pcm(chunk, item_size, 50);
-            s_tx_bytes += item_size;
-            vRingbufferReturnItem(s_pcm_rb, chunk);
-        } else {
-            // Si no hay datos, alimentar silencio para evitar underrun audible
-            (void)i2s_write_pcm(s_silence, sizeof(s_silence), 20);
+        // Espera a tener ~16 KB de datos antes de arrancar para evitar underruns iniciales
+        if (!started) {
+            size_t free_now = xRingbufferGetCurFreeSize(s_pcm_rb);
+            if ((PCM_RB_SIZE_BYTES - free_now) < (16*1024)) {
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
+            }
+            started = true;
         }
-        // Ceder CPU para evitar disparar WDT
-        vTaskDelay(1);
+        size_t item_size = 0;
+        uint8_t *item = (uint8_t *)xRingbufferReceive(s_pcm_rb, &item_size, recv_timeout);
+
+        if (item && item_size) {
+            size_t off = 0;
+            while (off < item_size) {
+                size_t copy_n = BLK - fill;
+                if (copy_n > (item_size - off)) copy_n = item_size - off;
+                memcpy(&blk_buf[fill], item + off, copy_n);
+                fill += copy_n;
+                off  += copy_n;
+
+                if (fill == BLK) {
+                    (void)i2s_write_pcm(blk_buf, BLK, 30);
+                    s_tx_bytes += BLK;
+                    fill = 0;
+                }
+            }
+            vRingbufferReturnItem(s_pcm_rb, item);
+        } else {
+            // No hay más datos; si tenemos parcial, completar con ceros y enviar
+            if (fill > 0) {
+                memset(&blk_buf[fill], 0, BLK - fill);
+                (void)i2s_write_pcm(blk_buf, BLK, 20);
+                s_tx_bytes += BLK;
+                fill = 0;
+            } else {
+                // Mantener DMA alimentado con silencio
+                (void)i2s_write_pcm(s_silence, BLK, 20);
+            }
+            vTaskDelay(1);
+        }
     }
 }
 
@@ -497,18 +435,37 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 {
     // 'data' es PCM 16-bit LE estéreo decodificado por la pila A2DP
-    if (len == 0 || data == NULL) return;
-    if (s_pcm_rb) {
-        // Encolar datos; si está lleno, descartar el bloque más viejo para evitar lag
-        while (xRingbufferSend(s_pcm_rb, (void *)data, len, 0) == pdFALSE) {
-            // Descartar datos antiguos hasta poder encolar
+    if (len == 0 || data == NULL || !s_pcm_rb) return;
+
+    // 2) Jitter buffer real: objetivo de ocupación y poda suave
+    const size_t RB_TOTAL   = PCM_RB_SIZE_BYTES;
+    size_t free_now         = xRingbufferGetCurFreeSize(s_pcm_rb);
+    size_t fill_now         = RB_TOTAL - free_now;
+    const size_t LOW_WATER  = PCM_LOW_WATER_BYTES;
+    const size_t HIGH_WATER = PCM_HIGH_WATER_BYTES;
+
+    // Si vamos muy llenos, podar sólo lo justo para mantenernos ≤ HIGH_WATER
+    if (fill_now > HIGH_WATER) {
+        size_t need_free = (fill_now + len) - HIGH_WATER;
+        while (need_free > 0) {
             size_t old_sz = 0;
-            uint8_t *old = (uint8_t *)xRingbufferReceiveUpTo(s_pcm_rb, &old_sz, 0, len);
-            if (!old) break;
+            size_t take = (need_free < 1024) ? need_free : 1024; // poda en rebanadas de 1 KB
+            uint8_t *old = (uint8_t*) xRingbufferReceiveUpTo(s_pcm_rb, &old_sz, 0, take);
+            if (!old || old_sz == 0) break;
             vRingbufferReturnItem(s_pcm_rb, old);
+            need_free = (old_sz >= need_free) ? 0 : (need_free - old_sz);
         }
-    s_rx_bytes += len;
     }
+
+    // Intenta NO perder el bloque: permite 2 ms de espera
+    if (xRingbufferSend(s_pcm_rb, (void*)data, len, pdMS_TO_TICKS(2)) == pdFALSE) {
+        // Último recurso: descarta 1 KB y reintenta
+        size_t old_sz = 0;
+        uint8_t *old = (uint8_t*) xRingbufferReceiveUpTo(s_pcm_rb, &old_sz, 0, 1024);
+        if (old) vRingbufferReturnItem(s_pcm_rb, old);
+        (void)xRingbufferSend(s_pcm_rb, (void*)data, len, 0);
+    }
+    s_rx_bytes += len;
 }
 
 static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
@@ -555,10 +512,16 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         
         // 🔒 PM Lock: Fijar frecuencia CPU durante audio
         if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
+            // Reducir verbosidad global durante reproducción; mantener este TAG en INFO
+            esp_log_level_set("*", ESP_LOG_WARN);
+            esp_log_level_set(TAG, ESP_LOG_INFO);
             if (s_pm_lock && esp_pm_lock_acquire(s_pm_lock) == ESP_OK) {
                 ESP_LOGI(TAG, "🔒 CPU frequency locked para audio estable");
             }
         } else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
+            // Restaurar verbosidad razonable al detenerse el audio
+            esp_log_level_set("*", ESP_LOG_INFO);
+            esp_log_level_set(TAG, ESP_LOG_INFO);
             if (s_pm_lock) {
                 esp_pm_lock_release(s_pm_lock);
                 ESP_LOGI(TAG, "🔓 CPU frequency unlocked");
@@ -663,7 +626,7 @@ static void bluetooth_a2dp_sink_init(void)
     ESP_ERROR_CHECK(esp_a2d_sink_register_data_callback(&bt_app_a2d_data_cb));
     ESP_ERROR_CHECK(esp_a2d_sink_init());
 
-    const char *dev_name = "ESP32 A2DP SEBAS";
+    const char *dev_name = "ESP32 A2DP SEBAS MAX";
     ESP_ERROR_CHECK(esp_bt_gap_set_device_name(dev_name));
     ESP_ERROR_CHECK(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
 
@@ -736,9 +699,9 @@ void app_main(void)
 
     // Lanzar tarea escritora I2S en Core 1 con prioridad ALTA
     if (s_i2s_writer_task == NULL) {
-        // Prefill ring buffer con silencio mínimo para reducir latencia inicial
+        // B3: Prefill ring buffer ~16 KB (8×2048B) para estabilidad inicial
         if (s_pcm_rb) {
-            for (int i = 0; i < 2; ++i) { // igual que antes
+            for (int i = 0; i < 8; ++i) {
                 (void)xRingbufferSend(s_pcm_rb, s_silence, sizeof(s_silence), 0);
             }
         }
@@ -747,13 +710,13 @@ void app_main(void)
             "i2s_writer",
             3072,
             NULL,
-            configMAX_PRIORITIES - 3, // Una prioridad un peldaño más baja
+            configMAX_PRIORITIES - 1, // Prioridad alta recomendada para escritura de audio
             &s_i2s_writer_task,
             1 /* CPU1 - dedicado para audio */);
         if (ok != pdPASS) {
             ESP_LOGE(TAG, "No se pudo crear i2s_writer_task");
         } else {
-            ESP_LOGI(TAG, "🎵 I2S writer task: Core 1, prioridad máxima-2");
+            ESP_LOGI(TAG, "🎵 I2S writer task: Core 1, prioridad máxima-1");
         }
         
         // Tarea de estadísticas en Core 0 con prioridad baja
