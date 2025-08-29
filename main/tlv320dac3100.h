@@ -57,3 +57,27 @@ void tlv320_diagnose_and_fix_dropout_issues(void);
 // Emergency fix for mixer configuration problem
 // Forces correct mixer routing when DAC->HP path is broken
 bool tlv320_emergency_mixer_fix(void);
+
+// 🔧 CRITICAL: Force correct clock configuration for BCLK=64×Fs
+// Call this after ESP32 I2S is generating BCLK with 32-bit slots
+// Overwrites previous clock config with mathematically correct values
+void tlv_force_clock_for_64fs(void);
+
+// ========== CLOCK VERIFICATION ==========
+// Verify clock math for debugging - call after I2S config
+void tlv320_verify_clock_math(int sample_rate, bool is_32bit_slots);
+
+// Read and verify registers after forcing 64×Fs configuration
+void tlv320_readback_clock(int sample_rate);
+
+// Dump current TLV320 clock configuration registers
+void tlv320_dump_clock_config(void);
+
+// ========== MCLK OPTIMIZATIONS ==========
+// Configure TLV320 to use MCLK directly (no PLL) for best jitter performance
+// MCLK = 256*Fs, NDAC=8, MDAC=2, DOSR=128 → internal clock = Fs
+bool tlv320_configure_mclk_direct(int sample_rate);
+
+// Initialize TLV320 for headphone output using MCLK instead of BCLK→PLL
+// Best audio quality with ESP32 APLL-generated stable MCLK
+bool tlv320_init_hp_from_mclk(int sample_rate);

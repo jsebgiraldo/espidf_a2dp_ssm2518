@@ -11,10 +11,12 @@
 // ESP-IDF
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_pm.h"  // Para PM locks y control de frecuencia
 // sdkconfig (Kconfig macros)
 #include "sdkconfig.h"
 // NVS
 #include "nvs_flash.h"
+#include "nvs.h"
 // I2C
 #include "driver/i2c.h"
 // GPIO for optional codec reset and line checks
@@ -44,21 +46,112 @@
 #define TLV320_RESET_IO          33
 #endif
 
-// I2S salida hacia SSM2518 (I2S Philips, 16-bit samples en slots de 32-bit, estéreo)
-// Ajusta estos pines según tu cableado hacia el PMOD AMP3
+// ========== CONFIGURACIÓN NVS PARA RUNTIME TESTING ==========
+
+static const char *TAG = "MAIN";
+
+typedef struct {
+    bool bclk_invert;
+    bool ws_invert;
+    uint32_t test_mode;  // 0=normal, 1=test pattern, 2=debug tones
+} i2s_test_config_t;
+
+// Leer configuración de test desde NVS
+esp_err_t load_i2s_test_config(i2s_test_config_t *config)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    
+    // Valores por defecto
+    config->bclk_invert = false;
+    config->ws_invert = false;
+    config->test_mode = 0;
+    
+    err = nvs_open("i2s_test", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No se puede abrir NVS i2s_test (primera vez): %s", esp_err_to_name(err));
+        return ESP_OK;  // Usar defaults
+    }
+    
+    size_t required_size = sizeof(i2s_test_config_t);
+    err = nvs_get_blob(nvs_handle, "config", config, &required_size);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "📋 Configuración I2S cargada desde NVS:");
+        ESP_LOGI(TAG, "   BCLK invert: %s", config->bclk_invert ? "YES" : "NO");
+        ESP_LOGI(TAG, "   WS invert: %s", config->ws_invert ? "YES" : "NO");
+        ESP_LOGI(TAG, "   Test mode: %lu", (unsigned long)config->test_mode);
+    } else {
+        ESP_LOGW(TAG, "No se puede leer config desde NVS: %s", esp_err_to_name(err));
+    }
+    
+    nvs_close(nvs_handle);
+    return ESP_OK;
+}
+
+// Guardar configuración de test en NVS
+esp_err_t save_i2s_test_config(const i2s_test_config_t *config)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    
+    err = nvs_open("i2s_test", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error abriendo NVS para escritura: %s", esp_err_to_name(err));
+        return err;
+    }
+    
+    err = nvs_set_blob(nvs_handle, "config", config, sizeof(i2s_test_config_t));
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "✅ Configuración I2S guardada en NVS");
+        }
+    }
+    
+    nvs_close(nvs_handle);
+    return err;
+}
+
+// Función para cambiar configuración I2S desde consola/log
+esp_err_t set_i2s_test_mode(bool bclk_inv, bool ws_inv, uint32_t test_mode)
+{
+    i2s_test_config_t config = {
+        .bclk_invert = bclk_inv,
+        .ws_invert = ws_inv,
+        .test_mode = test_mode
+    };
+    
+    esp_err_t err = save_i2s_test_config(&config);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "🔄 Nueva configuración I2S guardada. Reinicie para aplicar:");
+        ESP_LOGI(TAG, "   BCLK invert: %s", bclk_inv ? "YES" : "NO");
+        ESP_LOGI(TAG, "   WS invert: %s", ws_inv ? "YES" : "NO");
+        ESP_LOGI(TAG, "   Test mode: %lu", (unsigned long)test_mode);
+    }
+    
+    return err;
+}
+
+// ========== I2S INIT ==========
+// Configuración optimizada para usar BCLK como fuente de reloj del TLV320
 #define I2S_BCLK_IO              26   // BCLK
-#define I2S_LRCK_IO              25   // LRCLK / WS
-#define I2S_DOUT_IO              27   // SDATA hacia SSM2518
-#define I2S_MCLK_IO              -1  // MCLK hacia SSM2518 (Stand Alone requiere MCLK). Ajusta al pin cableado.
+#define I2S_LRCK_IO              25   // LRCLK / WS  
+#define I2S_DOUT_IO              27   // SDATA hacia codec
+#define I2S_MCLK_IO              -1   // MCLK deshabilitado - modo BCLK optimizado
 
 // Inversiones opcionales por si hay desalineación de flancos
-#ifndef I2S_WS_INVERT
-#define I2S_WS_INVERT            false
-#endif
+// 🔧 AJUSTES PARA PROBAR SI HAY "RASPADO" POR FLANCOS INCORRECTOS
+// Prueba estas combinaciones si el audio suena "raspado":
+// Opción 1: Solo BCLK invertido (más común para grano digital)
 #ifndef I2S_BCLK_INVERT
-#define I2S_BCLK_INVERT          false
+#define I2S_BCLK_INVERT          false  // Cambiar a true si hay grano digital
 #endif
-static const char *TAG = "MAIN";
+// Opción 2: Solo WS invertido (menos común)
+#ifndef I2S_WS_INVERT
+#define I2S_WS_INVERT            false  // Cambiar a true si BCLK_INVERT no ayuda
+#endif
+// IMPORTANTE: No dejes ambas invertidas a la vez salvo que lo verifiques
+// Lo típico cuando hay "grano digital" por borde es que invertir BCLK lo cura al instante
 
 // I2S handle
 static i2s_chan_handle_t s_tx_chan = NULL;
@@ -74,6 +167,9 @@ static bool s_tlv_active = false;
 static bool s_tlv_configured = false;
 static bool s_have_last_bda = false;
 static esp_bd_addr_t s_last_bda = {0};
+
+// PM lock para evitar cambios de frecuencia durante audio
+static esp_pm_lock_handle_t s_pm_lock = NULL;
 
 // (sin duplicado L/R por software)
 
@@ -172,56 +268,89 @@ static void i2s_init(uint32_t sample_rate)
 {
     s_current_sample_rate = sample_rate;
 
+    // Cargar configuración de test desde NVS
+    i2s_test_config_t test_config;
+    load_i2s_test_config(&test_config);
+
     i2s_chan_config_t chan_cfg;
     memset(&chan_cfg, 0, sizeof(chan_cfg));
     chan_cfg.id = I2S_NUM_0;
     chan_cfg.role = I2S_ROLE_MASTER;
-    // Balance entre latencia y robustez: varios desc y frames moderados
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 256;
+    // 🚀 OPTIMIZACIÓN: Buffers grandes para estabilidad sin MCLK
+    chan_cfg.dma_desc_num = 12;      // Aumentado para compensar variaciones
+    chan_cfg.dma_frame_num = 512;    // Buffer DMA grande para menos underruns
     chan_cfg.auto_clear = true;
     chan_cfg.intr_priority = 0;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL));
 
-    // Configurar I2S: datos 16-bit y slots de 16-bit (BCLK=fs*32). Esto coincide con la asunción del TLV (PLL por BCLK).
+    // 🎯 OPTIMIZACIÓN: Slots de 32-bit para BCLK estable = 64×Fs
     i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
-    slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT; // asegurar 32fs
+    
+    // 🔧 CONFIGURACIÓN EXPLÍCITA DE SLOTS para evitar alineación I2S incorrecta
+    slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT; // 32-bit slots → BCLK = 64×Fs
+    slot_cfg.bit_shift      = true;      // I2S (Philips) = 1-bit delay
+    // Nota: left_align, big_endian, bit_order_lsb no existen en ESP-IDF 5.4.1
+    // Estos se configuran automáticamente en el modo Philips estándar
+    
+    ESP_LOGI(TAG, "🔧 I2S Slot config: 32-bit slots, bit_shift=true, Philips mode, WS_invert=%s", 
+             test_config.ws_invert ? "YES" : "NO");
+    
     i2s_std_config_t std_cfg;
     memset(&std_cfg, 0, sizeof(std_cfg));
     std_cfg.clk_cfg = (i2s_std_clk_config_t) I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
     std_cfg.slot_cfg = slot_cfg;
-    // Si el codec TLV está activo y operamos sin MCLK, no sacar MCLK por pin
-    std_cfg.gpio_cfg.mclk = s_tlv_active ? I2S_GPIO_UNUSED : I2S_MCLK_IO;
+    
+    // � MODO BCLK: MCLK deshabilitado, TLV320 usa BCLK→PLL optimizado
+    std_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;  // Sin MCLK - modo BCLK puro
     std_cfg.gpio_cfg.bclk = I2S_BCLK_IO;
     std_cfg.gpio_cfg.ws   = I2S_LRCK_IO;
     std_cfg.gpio_cfg.dout = I2S_DOUT_IO;
     std_cfg.gpio_cfg.din  = I2S_GPIO_UNUSED;
     std_cfg.gpio_cfg.invert_flags.mclk_inv = false;
-    std_cfg.gpio_cfg.invert_flags.bclk_inv = I2S_BCLK_INVERT;
-    std_cfg.gpio_cfg.invert_flags.ws_inv   = I2S_WS_INVERT;
-    // Preferir APLL como fuente de reloj para reducir jitter
+    std_cfg.gpio_cfg.invert_flags.bclk_inv = test_config.bclk_invert;  // BCLK invert from NVS
+    std_cfg.gpio_cfg.invert_flags.ws_inv   = test_config.ws_invert;    // WS invert from NVS
+    
+    ESP_LOGI(TAG, "🔧 I2S Inversiones: BCLK=%s, WS=%s", 
+             test_config.bclk_invert ? "INVERTED" : "NORMAL",
+             test_config.ws_invert ? "INVERTED" : "NORMAL");
+    
+    // ⚡ CALIDAD: APLL para BCLK estable, aunque sin MCLK externo
     std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
-    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256; // Interno, no se saca al pin
+    
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
 
-    ESP_LOGI(TAG, "I2S init: SR=%lu, ws_inv=%d, bclk_inv=%d", (unsigned long)sample_rate, (int)I2S_WS_INVERT, (int)I2S_BCLK_INVERT);
+    ESP_LOGI(TAG, "🎵 I2S BCLK optimizado: SR=%lu, BCLK=%lu Hz, DMA=%lu×%lu", 
+             (unsigned long)sample_rate, 
+             (unsigned long)(sample_rate * 64),  // BCLK = 64×Fs con slots 32-bit
+             (unsigned long)chan_cfg.dma_desc_num, 
+             (unsigned long)chan_cfg.dma_frame_num);
+    ESP_LOGI(TAG, "📡 APLL activo, BCLK=64×Fs, TLV320 usará BCLK→PLL interno");
+    
+    // 🔍 MOSTRAR configuración de inversiones para debug
+    ESP_LOGI(TAG, "🔧 Inversiones: BCLK=%s, WS=%s", 
+             I2S_BCLK_INVERT ? "INVERTIDO" : "normal",
+             I2S_WS_INVERT ? "INVERTIDO" : "normal");
+    if (I2S_BCLK_INVERT || I2S_WS_INVERT) {
+        ESP_LOGW(TAG, "⚠️ Inversiones activas - para probar problemas de 'raspado' en audio");
+    }
 
     if (!s_i2s_mutex) {
         s_i2s_mutex = xSemaphoreCreateMutex();
     }
 
-    // Crear ring buffer para desacoplar callback BT de escritura I2S
+    // 🔄 OPTIMIZACIÓN: Ring buffer GRANDE para compensar drift sin MCLK
     if (s_pcm_rb == NULL) {
-        // 12 KB de buffer (~60ms a 48kHz 16-bit estéreo)
-        s_pcm_rb = xRingbufferCreate(12 * 1024, RINGBUF_TYPE_BYTEBUF);
+        // 32 KB de buffer (~170ms a 48kHz 16-bit estéreo) para estabilidad
+        s_pcm_rb = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
+        ESP_LOGI(TAG, "📦 Ring buffer: 32 KB para drift control en modo BCLK");
     }
 }
 
 static void audio_stats_task(void *arg)
 {
     size_t last_rx = 0, last_tx = 0;
-    uint32_t watchdog_counter = 0;
     
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -234,28 +363,24 @@ static void audio_stats_task(void *arg)
         
         ESP_LOGI(TAG, "Audio stats: RX %.1f kB/s, TX %.1f kB/s", drx / 1024.0f, dtx / 1024.0f);
         
-        // TLV320 audio watchdog every 10 seconds or when audio drops significantly
-        watchdog_counter++;
+        // TLV320 audio watchdog SOLO cuando detecta dropout de audio
         bool audio_dropped = (drx > 1000 && dtx < 1000); // Receiving but not transmitting
-        bool periodic_check = (watchdog_counter >= 10);
         
-        if (s_tlv_active && s_tlv_configured && (audio_dropped || periodic_check)) {
-            if (audio_dropped) {
-                ESP_LOGW(TAG, "🔥 AUDIO DROPOUT DETECTED! RX=%.1f kB/s, TX=%.1f kB/s", drx / 1024.0f, dtx / 1024.0f);
-                ESP_LOGW(TAG, "🔧 Ejecutando fix de emergencia para mixers...");
-                
-                // Ejecutar fix inmediato para problema de mixers
-                if (tlv320_emergency_mixer_fix()) {
-                    ESP_LOGI(TAG, "✅ Fix de emergencia aplicado - audio debería funcionar");
-                } else {
-                    ESP_LOGE(TAG, "❌ Fix de emergencia falló - problema de hardware");
-                }
-                
-                ESP_LOGW(TAG, "Running TLV320 full health check...");
-                tlv320_advanced_debug_and_health_check();
-                ESP_LOGW(TAG, "Running dropout-specific diagnosis and fixes...");
-                tlv320_diagnose_and_fix_dropout_issues();
+        if (s_tlv_active && s_tlv_configured && audio_dropped) {
+            ESP_LOGW(TAG, "🔥 AUDIO DROPOUT DETECTED! RX=%.1f kB/s, TX=%.1f kB/s", drx / 1024.0f, dtx / 1024.0f);
+            ESP_LOGW(TAG, "🔧 Ejecutando fix de emergencia para mixers...");
+            
+            // Ejecutar fix inmediato para problema de mixers
+            if (tlv320_emergency_mixer_fix()) {
+                ESP_LOGI(TAG, "✅ Fix de emergencia aplicado - audio debería funcionar");
+            } else {
+                ESP_LOGE(TAG, "❌ Fix de emergencia falló - problema de hardware");
             }
+            
+            ESP_LOGW(TAG, "Running TLV320 full health check...");
+            tlv320_advanced_debug_and_health_check();
+            ESP_LOGW(TAG, "Running dropout-specific diagnosis and fixes...");
+            tlv320_diagnose_and_fix_dropout_issues();
             
             if (tlv320_audio_watchdog_check_and_recover()) {
                 ESP_LOGI(TAG, "TLV320 watchdog performed recovery operations");
@@ -268,10 +393,6 @@ static void audio_stats_task(void *arg)
                     ESP_LOGE(TAG, "❌ Emergency fix post-watchdog falló");
                 }
             }
-            
-            if (periodic_check) {
-                watchdog_counter = 0; // Reset counter
-            }
         }
     }
 }
@@ -280,16 +401,21 @@ static void i2s_set_sample_rate(uint32_t sample_rate)
 {
     if (s_tx_chan == NULL) return;
     if (sample_rate == s_current_sample_rate) return;
-    ESP_LOGI(TAG, "Cambiando sample rate I2S: %lu -> %lu", (unsigned long)s_current_sample_rate, (unsigned long)sample_rate);
-    // Reconfigurar clock a nueva tasa
+    
+    ESP_LOGI(TAG, "🔄 Cambiando sample rate I2S: %lu -> %lu", (unsigned long)s_current_sample_rate, (unsigned long)sample_rate);
+    
+    // Reconfigurar clock manteniendo APLL para BCLK estable
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
-    // Mantener APLL como fuente y MCLK x256 para mayor estabilidad
     clk_cfg.clk_src = I2S_CLK_SRC_APLL;
-    clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256; // Interno solamente
+    
     ESP_ERROR_CHECK(i2s_channel_disable(s_tx_chan));
     ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(s_tx_chan, &clk_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
+    
     s_current_sample_rate = sample_rate;
+    ESP_LOGI(TAG, "📡 BCLK actualizado: %lu Hz (64×%lu) - TLV320 PLL se ajustará", 
+             (unsigned long)(sample_rate * 64), (unsigned long)sample_rate);
 }
 
 static size_t i2s_write_pcm(const uint8_t *data, size_t len, uint32_t timeout_ms)
@@ -409,28 +535,50 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         break;
     case ESP_A2D_AUDIO_STATE_EVT:
         ESP_LOGI(TAG, "A2DP estado audio: %d", param->audio_stat.state);
-        // Configurar TLV320 cuando comience la reproducción de audio
+        
+        // 🎵 Configurar TLV320 cuando comience la reproducción de audio
         if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED && s_tlv_active && !s_tlv_configured) {
-            ESP_LOGI(TAG, "Audio iniciado - configurando TLV320 EXCLUSIVAMENTE para HeadphoneOutput");
-            // Configurar clocks con sample rate por defecto
-            if (tlv320_configure_bclk_i2s_16(44100)) {
+            ESP_LOGI(TAG, "🚀 Audio iniciado - configurando TLV320 modo BCLK=64×Fs CORREGIDO");
+            ESP_LOGI(TAG, "📡 TLV320 usará BCLK→PLL con R=1, J=32 (configuración matemáticamente correcta)");
+            
+            // CONFIGURACIÓN CORREGIDA: Usar función específica para 64×Fs
+            if (tlv320_configure_bclk_i2s_16(s_current_sample_rate)) {
+                // 🔧 FORZAR configuración correcta para 64×Fs (pisa los valores anteriores)
+                ESP_LOGI(TAG, "🔧 Aplicando configuración FORZADA para BCLK=64×Fs...");
+                tlv_force_clock_for_64fs();
+                
                 // Configuración EXCLUSIVA para HeadphoneOutput HPL/HPR
                 if (tlv320_configure_headphone_only()) {
                     s_tlv_configured = true;
-                    ESP_LOGI(TAG, "✓ TLV320 configurado EXCLUSIVAMENTE para HeadphoneOutput HPL/HPR");
-                    ESP_LOGI(TAG, "✓ Routing: DAC_L -> HPL, DAC_R -> HPR");
-                    ESP_LOGI(TAG, "✓ Line outputs DESHABILITADOS");
+                    ESP_LOGI(TAG, "✅ TLV320 configurado en modo BCLK=64×Fs CORREGIDO");
+                    ESP_LOGI(TAG, "🎯 Clock: BCLK→PLL (R=1,J=32) → NDAC/8→MDAC/2→DOSR/128");
+                    ESP_LOGI(TAG, "🎧 Output: HPL/HPR únicamente, volúmenes -3dB para evitar clipping");
                     
-                    // Aplicar fix de emergencia inmediatamente para asegurar mixers correctos
-                    ESP_LOGI(TAG, "🔧 Aplicando fix preventivo de mixers...");
+                    // 📊 Verificación matemática del clock path
+                    ESP_LOGI(TAG, "🔍 Verificando clock math para BCLK=64×Fs...");
+                    tlv320_verify_clock_math(s_current_sample_rate, true); // true = 32-bit slots
+                    
+                    // Aplicar fix preventivo de mixers
+                    ESP_LOGI(TAG, "🔧 Aplicando configuración preventiva de mixers...");
                     tlv320_emergency_mixer_fix();
                     
                 } else {
-                    ESP_LOGE(TAG, "✗ FALLO en configuración HeadphoneOutput - verificar conexiones I2C");
-                    ESP_LOGE(TAG, "✗ No se intentarán configuraciones alternativas");
+                    ESP_LOGE(TAG, "❌ FALLO en configuración HeadphoneOutput - verificar conexiones I2C");
                 }
             } else {
-                ESP_LOGE(TAG, "✗ FALLO en configuración de clocks I2S");
+                ESP_LOGE(TAG, "❌ FALLO en configuración inicial de clocks");
+            }
+        }
+        
+        // 🔒 PM Lock: Fijar frecuencia CPU durante audio
+        if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
+            if (s_pm_lock && esp_pm_lock_acquire(s_pm_lock) == ESP_OK) {
+                ESP_LOGI(TAG, "🔒 CPU frequency locked para audio estable");
+            }
+        } else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
+            if (s_pm_lock) {
+                esp_pm_lock_release(s_pm_lock);
+                ESP_LOGI(TAG, "🔓 CPU frequency unlocked");
             }
         }
         break;
@@ -440,36 +588,71 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (param->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
             int sample_rate = 44100; // default
             uint8_t oct0 = param->audio_cfg.mcc.cie.sbc[0];
-            if (oct0 & (1 << 6)) sample_rate = 32000;
-            else if (oct0 & (1 << 5)) sample_rate = 44100;
-            else if (oct0 & (1 << 4)) sample_rate = 48000;
-            ESP_LOGI(TAG, "A2DP SBC sample_rate=%d", sample_rate);
+            
+            // 🔍 LOGGING DETALLADO para debug de sample rate (según solicitud del usuario)
+            ESP_LOGI(TAG, "📊 SBC oct0=0x%02X, bits: 6=%d 5=%d 4=%d", 
+                     oct0, 
+                     (oct0 & (1 << 6)) ? 1 : 0,
+                     (oct0 & (1 << 5)) ? 1 : 0, 
+                     (oct0 & (1 << 4)) ? 1 : 0);
+            
+            // Decodificar sample rate con logging detallado
+            if (oct0 & (1 << 6)) {
+                sample_rate = 32000;
+                ESP_LOGI(TAG, "🎵 SBC Sample Rate: 32 kHz (bit 6 set)");
+                ESP_LOGW(TAG, "⚠️ WARNING: 32 kHz puede causar audio 'grave' - verificar!");
+            }
+            else if (oct0 & (1 << 5)) {
+                sample_rate = 44100;
+                ESP_LOGI(TAG, "🎵 SBC Sample Rate: 44.1 kHz (bit 5 set) ✅");
+            }
+            else if (oct0 & (1 << 4)) {
+                sample_rate = 48000;
+                ESP_LOGI(TAG, "🎵 SBC Sample Rate: 48 kHz (bit 4 set) ✅");
+            }
+            else {
+                ESP_LOGW(TAG, "⚠️ SBC Sample Rate: UNKNOWN pattern 0x%02X, usando 44.1 kHz por defecto", oct0);
+            }
+            
+            ESP_LOGI(TAG, "🎯 Sample Rate FINAL decidido: %d Hz", sample_rate);
+            
+            // Actualizar I2S (que actualiza BCLK automáticamente)
             i2s_set_sample_rate(sample_rate);
-            // Si usamos TLV sin MCLK, reconfigurar PLL desde BCLK para la nueva tasa
+            
+            // 🔄 Reconfigurar TLV320 para nuevo sample rate en modo BCLK
             if (s_tlv_active) {
                 if (s_tlv_configured) {
-                    ESP_LOGI(TAG, "Actualizando sample rate del TLV320: %d", sample_rate);
+                    ESP_LOGI(TAG, "🔄 Actualizando TLV320 para nuevo sample rate: %d", sample_rate);
+                    ESP_LOGI(TAG, "📡 Reconfigurando BCLK→PLL para SR=%d", sample_rate);
                     if (!tlv320_configure_bclk_i2s_16(sample_rate)) {
-                        ESP_LOGW(TAG, "Failed to update TLV320 sample rate");
+                        ESP_LOGW(TAG, "⚠️  Failed to update BCLK config - usando configuración previa");
+                    } else {
+                        // 🔧 FORZAR configuración correcta para 64×Fs después del cambio de SR
+                        ESP_LOGI(TAG, "🔧 Aplicando configuración FORZADA para nuevo SR...");
+                        tlv_force_clock_for_64fs();
+                        // Verificar nueva configuración
+                        tlv320_verify_clock_math(sample_rate, true);
                     }
                 } else {
-                    ESP_LOGI(TAG, "Configurando TLV320 para sample rate: %d", sample_rate);
+                    ESP_LOGI(TAG, "🚀 Configurando TLV320 inicial para sample rate: %d", sample_rate);
+                    // Configuración inicial BCLK
                     if (!tlv320_configure_bclk_i2s_16(sample_rate)) {
                         ESP_LOGW(TAG, "Failed to configure TLV320 clocks for new sample rate");
                     } else {
-                        // Configuración EXCLUSIVA para HeadphoneOutput al cambiar sample rate
-                        ESP_LOGI(TAG, "Reconfigurando TLV320 EXCLUSIVAMENTE para HeadphoneOutput");
+                        // 🔧 FORZAR configuración correcta para 64×Fs en configuración inicial
+                        ESP_LOGI(TAG, "🔧 Aplicando configuración FORZADA inicial...");
+                        tlv_force_clock_for_64fs();
+                        
                         if (tlv320_configure_headphone_only()) {
                             s_tlv_configured = true;
-                            ESP_LOGI(TAG, "✓ HeadphoneOutput reconfigurado exitosamente para nuevo sample rate");
+                            ESP_LOGI(TAG, "✅ TLV320 configurado inicial BCLK exitoso");
+                            ESP_LOGI(TAG, "🎯 Clock: BCLK→PLL optimizado para SR=%d", sample_rate);
                             
-                            // Aplicar fix preventivo de mixers después de reconfiguración
-                            ESP_LOGI(TAG, "🔧 Aplicando fix preventivo de mixers post-reconfiguración...");
+                            // Verificar configuración inicial
+                            tlv320_verify_clock_math(sample_rate, true);
                             tlv320_emergency_mixer_fix();
-                            
                         } else {
-                            ESP_LOGE(TAG, "✗ FALLO en reconfiguración HeadphoneOutput");
-                            ESP_LOGE(TAG, "✗ No se usarán configuraciones alternativas");
+                            ESP_LOGE(TAG, "❌ Failed initial BCLK configuration");
                             s_tlv_configured = false;
                         }
                     }
@@ -566,12 +749,6 @@ void app_main(void)
     i2c_master_init();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // Configuración de audio confirmada
-    ESP_LOGI(TAG, "🎧 CONFIGURACIÓN: HeadphoneOutput EXCLUSIVO");
-    ESP_LOGI(TAG, "🎧 TLV320DAC3100 configurado SOLO para HPL/HPR");
-    ESP_LOGI(TAG, "🎧 Line outputs DESHABILITADOS en esta configuración");
-    ESP_LOGI(TAG, "🎧 Conecta audifonos a las salidas HPL y HPR del TLV320");
-
     // Opcional: reset del TLV320 si hay pin de reset cableado
     tlv320_reset_if_configured();
 
@@ -601,22 +778,24 @@ void app_main(void)
     ESP_LOGI(TAG, "Inicializando I2S...");
     i2s_init(44100);
 
-    // Con BCLK activo, resetear y configurar TLV completamente
+    // Con BCLK estable activo, configurar TLV completamente
     if (s_tlv_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Dar tiempo al I2S para generar BCLK estable
-        ESP_LOGI(TAG, "Ejecutando reset y configuración completa del TLV320...");
+        
+        ESP_LOGI(TAG, "🚀 Ejecutando configuración BCLK OPTIMIZADA del TLV320...");
         if (!tlv320_hardware_reset_and_init(44100)) {
-            ESP_LOGE(TAG, "Failed to reset and configure TLV320");
+            ESP_LOGE(TAG, "❌ Failed to reset and configure TLV320");
         } else {
-            ESP_LOGI(TAG, "TLV320 configurado exitosamente para auriculares 3.3V");
+            ESP_LOGI(TAG, "✅ TLV320 configurado exitosamente en modo BCLK optimizado");
+            ESP_LOGI(TAG, "🎯 Clock path: BCLK→PLL→NDAC/8→MDAC/2→DOSR/128");
         }
     }
 
-    // Lanzar tarea escritora I2S en Core 1 con prioridad alta
+    // Lanzar tarea escritora I2S en Core 1 con prioridad ALTA
     if (s_i2s_writer_task == NULL) {
         // Prefill ring buffer con silencio mínimo para reducir latencia inicial
         if (s_pcm_rb) {
-            for (int i = 0; i < 2; ++i) {
+            for (int i = 0; i < 4; ++i) {  // Más prefill para el buffer más grande
                 (void)xRingbufferSend(s_pcm_rb, s_silence, sizeof(s_silence), 0);
             }
         }
@@ -625,15 +804,28 @@ void app_main(void)
             "i2s_writer",
             3072,
             NULL,
-            configMAX_PRIORITIES - 3,
+            configMAX_PRIORITIES - 2, // 🚀 PRIORIDAD MÁS ALTA para menos jitter
             &s_i2s_writer_task,
-            1 /* CPU1 */);
+            1 /* CPU1 - dedicado para audio */);
         if (ok != pdPASS) {
             ESP_LOGE(TAG, "No se pudo crear i2s_writer_task");
+        } else {
+            ESP_LOGI(TAG, "🎵 I2S writer task: Core 1, prioridad máxima-2");
         }
-        // Tarea de estadísticas (opcional)
+        
+        // Tarea de estadísticas en Core 0 con prioridad baja
         if (s_audio_stats_task == NULL) {
             xTaskCreatePinnedToCore(audio_stats_task, "audio_stats", 2048, NULL, tskIDLE_PRIORITY+1, &s_audio_stats_task, 0);
+        }
+    }
+
+    // 🔒 Inicializar PM lock para estabilidad de frecuencia durante audio
+    if (s_pm_lock == NULL) {
+        esp_err_t ret = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "audio", &s_pm_lock);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "🔒 PM lock creado para frecuencia CPU estable durante audio");
+        } else {
+            ESP_LOGW(TAG, "⚠️  No se pudo crear PM lock: %s", esp_err_to_name(ret));
         }
     }
 
