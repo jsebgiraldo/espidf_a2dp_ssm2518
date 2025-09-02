@@ -405,12 +405,6 @@ bool tlv320_hardware_reset_and_init(int sample_rate)
     ESP_LOGI(TAG, "🔍 Verificando configuración mediante readback...");
     tlv320_readback_clock(44100);  // Asumir 44.1kHz para verificación
     
-    // SOLO configuración analógica (sin tocar clocks)
-    if (!tlv320_configure_headphone_only()) {
-        ESP_LOGE(TAG, "Failed to enable TLV320 output after reset");
-        return false;
-    }
-    
     ESP_LOGI(TAG, "TLV320 reset completo y reconfiguración exitosa");
     return true;
 }
