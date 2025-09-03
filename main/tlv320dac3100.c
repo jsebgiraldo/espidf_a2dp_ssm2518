@@ -418,7 +418,10 @@ bool tlv320_configure_dual_output(void)
     tlv_write_ok(0x01, 0x20, 0x00);          // Class-D OFF para limpiar fault
     vTaskDelay(pdMS_TO_TICKS(5));
     tlv_write_ok(0x01, 0x20, 0x80);          // Class-D ON
-    tlv_write_ok(0x01, 0x2A, 0x1C);          // Class-D unmute, ganancia mínima no-mute
+
+    //tlv_write_ok(0x01, 0x2A, 0x1C);          // Class-D unmute, ganancia mínima no-mute, 24dB
+    //tlv_write_ok(0x01, 0x2A, 0b00011100);          // Class-D unmute, ganancia mínima no-mute, 24dB
+    tlv_write_ok(0x01, 0x2A, 0b00000100);          // Class-D unmute, ganancia mínima no-mute , 6dB
 
     vTaskDelay(pdMS_TO_TICKS(200));
     return true;
