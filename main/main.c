@@ -27,8 +27,6 @@
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
-// SSM2518 driver (simple)
-#include "ssm2518.h"
 // TLV320DAC3100 driver (scaffold)
 #include "tlv320dac3100.h"
 
@@ -51,13 +49,6 @@
 #define I2S_DOUT_IO              27   // SDATA hacia SSM2518
 #define I2S_MCLK_IO              -1  // MCLK hacia SSM2518 (Stand Alone requiere MCLK). Ajusta al pin cableado.
 
-// Inversiones opcionales por si hay desalineación de flancos
-#ifndef I2S_WS_INVERT
-#define I2S_WS_INVERT            false
-#endif
-#ifndef I2S_BCLK_INVERT
-#define I2S_BCLK_INVERT          false
-#endif
 static const char *TAG = "MAIN";
 
 // I2S handle
@@ -92,19 +83,6 @@ static void i2c_master_init(void)
     conf.clk_flags = 0;
     ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0));
-}
-
-static bool ssm2518_detected(void)
-{
-    // Enviar sólo dirección para comprobar ACK
-    uint8_t addr8 = (SSM2518_I2C_ADDR_7BIT << 1) | I2C_MASTER_WRITE;
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, addr8, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 100 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd);
-    return (ret == ESP_OK);
 }
 
 static bool tlv320_present(uint8_t *addr_out)
@@ -185,7 +163,6 @@ static void i2s_init(uint32_t sample_rate)
 
     // Configurar I2S: datos 16-bit y slots de 16-bit (BCLK=fs*32). Esto coincide con la asunción del TLV (PLL por BCLK).
     i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
-    slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT; // asegurar 32fs
     i2s_std_config_t std_cfg;
     memset(&std_cfg, 0, sizeof(std_cfg));
     std_cfg.clk_cfg = (i2s_std_clk_config_t) I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
@@ -197,8 +174,8 @@ static void i2s_init(uint32_t sample_rate)
     std_cfg.gpio_cfg.dout = I2S_DOUT_IO;
     std_cfg.gpio_cfg.din  = I2S_GPIO_UNUSED;
     std_cfg.gpio_cfg.invert_flags.mclk_inv = false;
-    std_cfg.gpio_cfg.invert_flags.bclk_inv = I2S_BCLK_INVERT;
-    std_cfg.gpio_cfg.invert_flags.ws_inv   = I2S_WS_INVERT;
+    std_cfg.gpio_cfg.invert_flags.bclk_inv = false;
+    std_cfg.gpio_cfg.invert_flags.ws_inv   = false;
     // Preferir APLL como fuente de reloj para reducir jitter
     std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
     std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
@@ -221,8 +198,6 @@ static void i2s_init(uint32_t sample_rate)
 static void audio_stats_task(void *arg)
 {
     size_t last_rx = 0, last_tx = 0;
-    uint32_t watchdog_counter = 0;
-    
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         size_t rx = s_rx_bytes;
@@ -233,46 +208,6 @@ static void audio_stats_task(void *arg)
         last_tx = tx;
         
         ESP_LOGI(TAG, "Audio stats: RX %.1f kB/s, TX %.1f kB/s", drx / 1024.0f, dtx / 1024.0f);
-        
-        // TLV320 audio watchdog every 10 seconds or when audio drops significantly
-        watchdog_counter++;
-        bool audio_dropped = (drx > 1000 && dtx < 1000); // Receiving but not transmitting
-        bool periodic_check = (watchdog_counter >= 10);
-        
-        if (s_tlv_active && s_tlv_configured && (audio_dropped || periodic_check)) {
-            if (audio_dropped) {
-                ESP_LOGW(TAG, "🔥 AUDIO DROPOUT DETECTED! RX=%.1f kB/s, TX=%.1f kB/s", drx / 1024.0f, dtx / 1024.0f);
-                ESP_LOGW(TAG, "🔧 Ejecutando fix de emergencia para mixers...");
-                
-                // Ejecutar fix inmediato para problema de mixers
-                if (tlv320_emergency_mixer_fix()) {
-                    ESP_LOGI(TAG, "✅ Fix de emergencia aplicado - audio debería funcionar");
-                } else {
-                    ESP_LOGE(TAG, "❌ Fix de emergencia falló - problema de hardware");
-                }
-                
-                ESP_LOGW(TAG, "Running TLV320 full health check...");
-                tlv320_advanced_debug_and_health_check();
-                ESP_LOGW(TAG, "Running dropout-specific diagnosis and fixes...");
-                tlv320_diagnose_and_fix_dropout_issues();
-            }
-            
-            if (tlv320_audio_watchdog_check_and_recover()) {
-                ESP_LOGI(TAG, "TLV320 watchdog performed recovery operations");
-                
-                // Aplicar emergency fix adicional para asegurar que los mixers estén correctos
-                ESP_LOGW(TAG, "🚨 Aplicando emergency fix adicional post-watchdog...");
-                if (tlv320_emergency_mixer_fix()) {
-                    ESP_LOGI(TAG, "✅ Emergency fix post-watchdog exitoso");
-                } else {
-                    ESP_LOGE(TAG, "❌ Emergency fix post-watchdog falló");
-                }
-            }
-            
-            if (periodic_check) {
-                watchdog_counter = 0; // Reset counter
-            }
-        }
     }
 }
 
@@ -312,12 +247,12 @@ static void i2s_writer_task(void *arg)
         uint8_t *chunk = (uint8_t *)xRingbufferReceive(s_pcm_rb, &item_size, recv_timeout);
         if (chunk && item_size) {
             // Escribir el bloque recibido a I2S
-            (void)i2s_write_pcm(chunk, item_size, 50);
+            (void)i2s_write_pcm(chunk, item_size, 1000);
             s_tx_bytes += item_size;
             vRingbufferReturnItem(s_pcm_rb, chunk);
         } else {
             // Si no hay datos, alimentar silencio para evitar underrun audible
-            (void)i2s_write_pcm(s_silence, sizeof(s_silence), 20);
+            (void)i2s_write_pcm(s_silence, sizeof(s_silence), 1000);
         }
         // Ceder CPU para evitar disparar WDT
         vTaskDelay(1);
@@ -585,16 +520,6 @@ void app_main(void)
         ESP_LOGI(TAG, "TLV320DAC3100 detectado en 0x%02X - configuración después de I2S", tlv_addr);
         s_tlv_active = true;
         // NO configurar aquí - esperar hasta que I2S genere BCLK
-    } else {
-        // Si no hay TLV, intentar SSM2518
-        bool i2c_ok = ssm2518_detected();
-        if (i2c_ok) {
-            ESP_LOGI(TAG, "SSM2518 detectado por I2C (0x%02X). Modo programable.", SSM2518_I2C_ADDR_7BIT);
-            ssm2518_set_address(SSM2518_I2C_ADDR_7BIT);
-            ssm2518_configure();
-        } else {
-            ESP_LOGW(TAG, "No se detectó TLV320 ni SSM2518 por I2C. Continuando: SSM2518 Stand Alone / sólo I2S.");
-        }
     }
 
     // Inicializar I2S (salida) antes del Bluetooth
