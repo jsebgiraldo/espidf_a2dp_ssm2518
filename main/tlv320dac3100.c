@@ -186,6 +186,7 @@ static bool tlv_write_ok(uint8_t page, uint8_t reg, uint8_t val)
 bool tlv320_configure_bclk_i2s_16(int sample_rate)
 {
     // Configuración completa para TLV320DAC3100 usando BCLK como fuente PLL
+    // Asume I2S 16-bit en slots de 16-bit (BCLK = Fs * 32). Si usas slots de 32-bit, BCLK=Fs*64 y el DAC oirá Fs' = BCLK/32 = 2*Fs.
     // Optimizada para salida de auriculares a 3.3V
     if (!(sample_rate == 44100 || sample_rate == 48000)) {
         ESP_LOGE(TAG, "Unsupported SR %d for BCLK mode (use 44100 or 48000)", sample_rate);
@@ -207,7 +208,7 @@ bool tlv320_configure_bclk_i2s_16(int sample_rate)
     if (!tlv_write_ok(0x00, 0x1D, 0x01)) return false; // BCLK/WCLK inputs
 
     // 3. Clock configuration: BCLK como fuente PLL
-    if (!tlv_write_ok(0x00, 0x04, 0x04)) return false; // BCLK como PLL ref
+    if (!tlv_write_ok(0x00, 0x04, 0x07)) return false; // BCLK como PLL ref
 
     // 4. PLL Programming: P=1, R=1, J=8, D=0
     if (!tlv_write_ok(0x00, 0x05, 0x91)) return false; // P=1, R=1, PLL powered
@@ -375,147 +376,51 @@ bool tlv320_hardware_reset_and_init(int sample_rate)
         return false;
     }
     
-    if (!tlv320_enable_speaker_out_max()) {
-        ESP_LOGE(TAG, "Failed to enable TLV320 output after reset");
-        return false;
-    }
-    
     ESP_LOGI(TAG, "TLV320 reset completo y reconfiguración exitosa");
     return true;
 }
 
 bool tlv320_configure_dual_output(void)
 {
-    ESP_LOGI(TAG, "Configurando TLV320 para salida dual: Headphones + Speaker");
-    
-    // ========== PAGE 1: ANALOG ROUTING AND POWER ==========
-    if (!tlv_write_ok(0x01, 0x00, 0x01)) {
-        ESP_LOGE(TAG, "Failed to switch to page 1");
-        return false;
-    }
-    
-    // 1. Configure analog power supplies for dual output
-    if (!tlv_write_ok(0x01, 0x01, 0x08)) { // Disable weak AVDD connection
-        ESP_LOGE(TAG, "Failed to configure analog power");
-        return false;
-    }
-    if (!tlv_write_ok(0x01, 0x02, 0x01)) { // Enable master analog power
-        ESP_LOGE(TAG, "Failed to enable analog power");
-        return false;
-    }
-    
-    // 2. Configure output routing for both HP and Line outputs
-    // Bit[7:6] = 01: DAC_L -> HPL, Bit[5:4] = 01: DAC_R -> HPR  
-    // Bit[3:2] = 01: DAC_L -> LOL, Bit[1:0] = 01: DAC_R -> LOR
-    if (!tlv_write_ok(0x01, 0x23, 0x55)) { // Route to both HP and Line outputs
-        ESP_LOGE(TAG, "Failed to set dual output routing");
-        return false;
-    }
-    
-    // 3. Configure mixers for DAC routing to HP outputs
-    if (!tlv_write_ok(0x01, 0x0C, 0x08)) { // Left DAC routed to HPL
-        ESP_LOGE(TAG, "Failed to route left DAC to HPL");
-        return false;
-    }
-    if (!tlv_write_ok(0x01, 0x0D, 0x08)) { // Right DAC routed to HPR
-        ESP_LOGE(TAG, "Failed to route right DAC to HPR");
-        return false;
-    }
-    
-    // 4. Configure mixers for DAC routing to Line outputs (for speaker)
-    if (!tlv_write_ok(0x01, 0x0E, 0x08)) { // Left DAC routed to LOL
-        ESP_LOGE(TAG, "Failed to route left DAC to LOL");
-        return false;
-    }
-    if (!tlv_write_ok(0x01, 0x0F, 0x08)) { // Right DAC routed to LOR
-        ESP_LOGE(TAG, "Failed to route right DAC to LOR");
-        return false;
-    }
-    
-    // 5. Configure HP drivers for 3.3V operation
-    if (!tlv_write_ok(0x01, 0x1F, 0x0C)) { // HP drivers: powered, class-AB for 3.3V
-        ESP_LOGE(TAG, "Failed to configure HP drivers");
-        return false;
-    }
-    
-    // 6. Configure Line Output drivers for speaker
-    if (!tlv_write_ok(0x01, 0x20, 0x06)) { // Line drivers: powered, class-AB
-        ESP_LOGE(TAG, "Failed to configure Line drivers");
-        return false;
-    }
-    
-    // 7. Power up both HP and Line output stages
-    if (!tlv_write_ok(0x01, 0x09, 0x3C)) { // HPL, HPR, LOL, LOR powered up
-        ESP_LOGE(TAG, "Failed to power up outputs");
-        return false;
-    }
-    
-    // 8. Set HP volumes (0x80 enables routing + volume)
-    if (!tlv_write_ok(0x01, 0x10, 0x80)) { // HPL volume: routing enabled, 0dB
-        ESP_LOGE(TAG, "Failed to set HPL volume");
-        return false;
-    }
-    if (!tlv_write_ok(0x01, 0x11, 0x80)) { // HPR volume: routing enabled, 0dB
-        ESP_LOGE(TAG, "Failed to set HPR volume");
-        return false;
-    }
-    
-    // 9. Set Line Output volumes for speaker (0x80 enables + moderate volume)
-    if (!tlv_write_ok(0x01, 0x12, 0x92)) { // LOL volume: routing enabled, +6dB for speaker
-        ESP_LOGE(TAG, "Failed to set LOL volume");
-        return false;
-    }
-    if (!tlv_write_ok(0x01, 0x13, 0x92)) { // LOR volume: routing enabled, +6dB for speaker
-        ESP_LOGE(TAG, "Failed to set LOR volume");
-        return false;
-    }
-    
-    // 10. Unmute all outputs
-    if (!tlv_write_ok(0x01, 0x16, 0x00)) { // HP unmute
-        ESP_LOGE(TAG, "Failed to unmute HP outputs");
-        return false;
-    }
-    if (!tlv_write_ok(0x01, 0x17, 0x00)) { // Line Out unmute
-        ESP_LOGE(TAG, "Failed to unmute Line outputs");
-        return false;
-    }
-    
-    // ========== PAGE 0: DIGITAL CONFIGURATION ==========
-    if (!tlv_write_ok(0x00, 0x00, 0x00)) {
-        ESP_LOGE(TAG, "Failed to switch back to page 0");
-        return false;
-    }
-    
-    // 11. Set DAC volumes (moderate level for dual output)
-    if (!tlv_write_ok(0x00, 0x41, 0x08)) { // Left DAC: -4dB to prevent clipping
-        ESP_LOGE(TAG, "Failed to set left DAC volume");
-        return false;
-    }
-    if (!tlv_write_ok(0x00, 0x42, 0x08)) { // Right DAC: -4dB to prevent clipping
-        ESP_LOGE(TAG, "Failed to set right DAC volume");
-        return false;
-    }
-    
-    // 12. Unmute both DACs
-    if (!tlv_write_ok(0x00, 0x40, 0x00)) { // Unmute both DACs
-        ESP_LOGE(TAG, "Failed to unmute DACs");
-        return false;
-    }
-    
-    // 13. Ensure DACs are powered and datapath is active
-    if (!tlv_write_ok(0x00, 0x3F, 0xD6)) { // Both DACs on, datapath active
-        ESP_LOGE(TAG, "Failed to ensure DAC power");
-        return false;
-    }
-    
-    vTaskDelay(pdMS_TO_TICKS(100)); // Allow analog circuits to settle
-    
-    ESP_LOGI(TAG, "TLV320 configurado para salida dual: Headphones + Speaker");
-    ESP_LOGI(TAG, "- Headphones: 3.3V compatible, 0dB gain");
-    ESP_LOGI(TAG, "- Speaker: Line Out +6dB, requiere 5V para potencia completa");
-    
-    tlv320_dump_debug();
-    
+    ESP_LOGI(TAG, "TLV320: Dual = HP estéreo + SPK (mono desde mixer izq)");
+
+    // --- PAGE 0: mantener PRB y DACs coherentes con el init ---
+    tlv_write_ok(0x00, 0x3C, 0x01);          // PRB_P1 (igual que en tu init)
+    tlv_write_ok(0x00, 0x3F, 0xD4);          // LDAC/RDAC ON + data path
+    tlv_write_ok(0x00, 0x40, 0x00);          // Unmute DACs
+    tlv_write_ok(0x00, 0x41, 0x10);          // -8 dB digital (arranque)
+    tlv_write_ok(0x00, 0x42, 0x10);
+
+    // --- PAGE 1: potencia analógica y ruteos ---
+    tlv_write_ok(0x01, 0x01, 0x08);          // Disable weak AVDD
+    tlv_write_ok(0x01, 0x02, 0x01);          // Master analog power ON
+
+    // 1) Ruteo de DAC a mezcladores HP (necesario para HPL/HPR)
+    tlv_write_ok(0x01, 0x0C, 0x08);          // DAC_L -> mixer L (HP path)
+    tlv_write_ok(0x01, 0x0D, 0x08);          // DAC_R -> mixer R (HP path)
+    // 2) Ruteo base que alimenta los mixers analógicos (de aquí toma señal el Class-D)
+    tlv_write_ok(0x01, 0x21, 0x44);          // LDAC→Left mixer, RDAC→Right mixer
+    //    Si quieres SPK MONO (L+R en el mixer izq): usa 0x4C en vez de 0x44.
+
+    // 3) Conectar mezcladores a salidas HP (¡esto te faltaba!)
+    tlv_write_ok(0x01, 0x23, 0x44);          // DAC_L→HPL, DAC_R→HPR
+
+    // 4) HP drivers, PGAs y power stage
+    tlv_write_ok(0x01, 0x1F, 0xD0);          // HP drivers ON (CM apropiado)
+    tlv_write_ok(0x01, 0x28, 0x06);          // HPL PGA 0 dB (unmute)
+    tlv_write_ok(0x01, 0x29, 0x06);          // HPR PGA 0 dB (unmute)
+    tlv_write_ok(0x01, 0x24, 0x80);          // HPL vol enable (0 dB)
+    tlv_write_ok(0x01, 0x25, 0x80);          // HPR vol enable (0 dB)
+    tlv_write_ok(0x01, 0x09, 0x30);          // Power stage HPL/HPR ON
+
+    // 5) Class-D: enganchar al volumen analógico izq + encender
+    tlv_write_ok(0x01, 0x26, 0x80);          // SPK_VOL: bit7=1 (conectado), 0 dB
+    tlv_write_ok(0x01, 0x20, 0x00);          // Class-D OFF para limpiar fault
+    vTaskDelay(pdMS_TO_TICKS(5));
+    tlv_write_ok(0x01, 0x20, 0x80);          // Class-D ON
+    tlv_write_ok(0x01, 0x2A, 0x1C);          // Class-D unmute, ganancia mínima no-mute
+
+    vTaskDelay(pdMS_TO_TICKS(200));
     return true;
 }
 
@@ -732,320 +637,3 @@ bool tlv320_configure_headphone_only(void)
     return true;
 }
 
-void tlv320_advanced_debug_and_health_check(void)
-{
-    ESP_LOGI(TAG, "=== TLV320 ADVANCED HEALTH CHECK ===");
-    
-    uint8_t v;
-    
-    // Page 0 - Digital Status
-    ESP_LOGI(TAG, "--- PAGE 0 (Digital) ---");
-    if (tlv_read_reg(0x00, 0x00, &v) == ESP_OK) ESP_LOGI(TAG, "P0:PAGE_SEL(0x00)=0x%02X", v);
-    if (tlv_read_reg(0x00, 0x01, &v) == ESP_OK) ESP_LOGI(TAG, "P0:RESET(0x01)=0x%02X %s", v, (v&0x01)?"RESET_ACTIVE":"NORMAL");
-    if (tlv_read_reg(0x00, 0x1B, &v) == ESP_OK) ESP_LOGI(TAG, "P0:IF_CTRL1(0x1B)=0x%02X I2S=%s", v, (v&0xC0)==0x00?"I2S":"OTHER");
-    if (tlv_read_reg(0x00, 0x3F, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P0:DAC_DP(0x3F)=0x%02X LDAC=%s RDAC=%s", v, 
-                 (v&0x80)?"ON":"OFF", (v&0x40)?"ON":"OFF");
-        if ((v & 0xC0) != 0xC0) ESP_LOGW(TAG, "WARNING: One or both DACs are OFF!");
-    }
-    if (tlv_read_reg(0x00, 0x40, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P0:DAC_VOLCTL(0x40)=0x%02X LDAC_MUTE=%s RDAC_MUTE=%s", v,
-                 (v&0x08)?"MUTED":"UNMUTED", (v&0x04)?"MUTED":"UNMUTED");
-        if (v & 0x0C) ESP_LOGW(TAG, "WARNING: One or both DACs are MUTED!");
-    }
-    if (tlv_read_reg(0x00, 0x41, &v) == ESP_OK) ESP_LOGI(TAG, "P0:DAC_LVOL(0x41)=0x%02X (%+.1fdB)", v, v * -0.5f);
-    if (tlv_read_reg(0x00, 0x42, &v) == ESP_OK) ESP_LOGI(TAG, "P0:DAC_RVOL(0x42)=0x%02X (%+.1fdB)", v, v * -0.5f);
-    
-    // Page 1 - Analog Status
-    ESP_LOGI(TAG, "--- PAGE 1 (Analog) ---");
-    if (tlv_read_reg(0x01, 0x01, &v) == ESP_OK) ESP_LOGI(TAG, "P1:PWR_CFG(0x01)=0x%02X", v);
-    if (tlv_read_reg(0x01, 0x02, &v) == ESP_OK) ESP_LOGI(TAG, "P1:ANALOG_PWR(0x02)=0x%02X %s", v, (v&0x01)?"ENABLED":"DISABLED");
-    if (tlv_read_reg(0x01, 0x09, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P1:OUT_PWR(0x09)=0x%02X HPL=%s HPR=%s", v,
-                 (v&0x20)?"ON":"OFF", (v&0x10)?"ON":"OFF");
-        if ((v & 0x30) != 0x30) ESP_LOGW(TAG, "WARNING: HP outputs not powered!");
-    }
-    if (tlv_read_reg(0x01, 0x1F, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P1:HP_DRV(0x1F)=0x%02X HPL_DRV=%s HPR_DRV=%s", v,
-                 (v&0x02)?"ON":"OFF", (v&0x01)?"ON":"OFF");
-        if ((v & 0x03) != 0x03) ESP_LOGW(TAG, "WARNING: HP drivers not enabled!");
-    }
-    if (tlv_read_reg(0x01, 0x23, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P1:OUT_ROUT(0x23)=0x%02X", v);
-        if ((v & 0xF0) != 0x50) ESP_LOGW(TAG, "WARNING: HP routing incorrect! Expected 0x5x, got 0x%02X", v);
-    }
-    if (tlv_read_reg(0x01, 0x24, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P1:HPL_VOL(0x24)=0x%02X EN=%s VOL=%+.1fdB", v,
-                 (v&0x80)?"YES":"NO", (v&0x7F) * -0.5f);
-        if (!(v & 0x80)) ESP_LOGW(TAG, "WARNING: HPL amplifier DISABLED!");
-    }
-    if (tlv_read_reg(0x01, 0x25, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P1:HPR_VOL(0x25)=0x%02X EN=%s VOL=%+.1fdB", v,
-                 (v&0x80)?"YES":"NO", (v&0x7F) * -0.5f);
-        if (!(v & 0x80)) ESP_LOGW(TAG, "WARNING: HPR amplifier DISABLED!");
-    }
-    if (tlv_read_reg(0x01, 0x0C, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P1:MIXL_CFG(0x0C)=0x%02X DAC_L_TO_HP=%s", v, (v&0x08)?"ROUTED":"NOT_ROUTED");
-        if (!(v & 0x08)) ESP_LOGW(TAG, "WARNING: Left DAC not routed to HP mixer!");
-    }
-    if (tlv_read_reg(0x01, 0x0D, &v) == ESP_OK) {
-        ESP_LOGI(TAG, "P1:MIXR_CFG(0x0D)=0x%02X DAC_R_TO_HP=%s", v, (v&0x08)?"ROUTED":"NOT_ROUTED");
-        if (!(v & 0x08)) ESP_LOGW(TAG, "WARNING: Right DAC not routed to HP mixer!");
-    }
-    
-    ESP_LOGI(TAG, "=== END HEALTH CHECK ===");
-}
-
-bool tlv320_audio_watchdog_check_and_recover(void)
-{
-    uint8_t dac_power, dac_mute, hpl_vol, hpr_vol, hp_drv, out_pwr;
-    bool needs_recovery = false;
-    
-    // Check critical registers for audio path integrity
-    if (tlv_read_reg(0x00, 0x3F, &dac_power) != ESP_OK) {
-        ESP_LOGW(TAG, "Watchdog: Cannot read DAC power register");
-        return false;
-    }
-    
-    if (tlv_read_reg(0x00, 0x40, &dac_mute) != ESP_OK) {
-        ESP_LOGW(TAG, "Watchdog: Cannot read DAC mute register");
-        return false;
-    }
-    
-    if (tlv_read_reg(0x01, 0x24, &hpl_vol) != ESP_OK) {
-        ESP_LOGW(TAG, "Watchdog: Cannot read HPL volume register");
-        return false;
-    }
-    
-    if (tlv_read_reg(0x01, 0x25, &hpr_vol) != ESP_OK) {
-        ESP_LOGW(TAG, "Watchdog: Cannot read HPR volume register");
-        return false;
-    }
-    
-    if (tlv_read_reg(0x01, 0x1F, &hp_drv) != ESP_OK) {
-        ESP_LOGW(TAG, "Watchdog: Cannot read HP driver register");
-        return false;
-    }
-    
-    if (tlv_read_reg(0x01, 0x09, &out_pwr) != ESP_OK) {
-        ESP_LOGW(TAG, "Watchdog: Cannot read output power register");
-        return false;
-    }
-    
-    // Check for known failure conditions
-    if ((dac_power & 0xC0) != 0xC0) {
-        ESP_LOGW(TAG, "Watchdog: DACs powered down (0x%02X), recovering...", dac_power);
-        tlv_write_reg(0x00, 0x3F, 0xD4);
-        needs_recovery = true;
-    }
-    
-    if (dac_mute & 0x0C) {
-        ESP_LOGW(TAG, "Watchdog: DACs muted (0x%02X), recovering...", dac_mute);
-        tlv_write_reg(0x00, 0x40, 0x00);
-        needs_recovery = true;
-    }
-    
-    if (!(hpl_vol & 0x80)) {
-        ESP_LOGW(TAG, "Watchdog: HPL amplifier disabled (0x%02X), recovering...", hpl_vol);
-        tlv_write_reg(0x01, 0x24, 0x80);
-        needs_recovery = true;
-    }
-    
-    if (!(hpr_vol & 0x80)) {
-        ESP_LOGW(TAG, "Watchdog: HPR amplifier disabled (0x%02X), recovering...", hpr_vol);
-        tlv_write_reg(0x01, 0x25, 0x80);
-        needs_recovery = true;
-    }
-    
-    if ((hp_drv & 0x03) != 0x03) {
-        ESP_LOGW(TAG, "Watchdog: HP drivers not enabled (0x%02X), recovering...", hp_drv);
-        tlv_write_reg(0x01, 0x1F, 0x03);
-        needs_recovery = true;
-    }
-    
-    if ((out_pwr & 0x30) != 0x30) {
-        ESP_LOGW(TAG, "Watchdog: HP outputs not powered (0x%02X), recovering...", out_pwr);
-        tlv_write_reg(0x01, 0x09, 0x30);
-        needs_recovery = true;
-    }
-    
-    // CRÍTICO: Verificar y corregir mixers (problema principal)
-    uint8_t mixl, mixr;
-    if (tlv_read_reg(0x01, 0x0C, &mixl) && tlv_read_reg(0x01, 0x0D, &mixr)) {
-        if (mixl != 0x08) {
-            ESP_LOGW(TAG, "Watchdog: MIXL incorrecto (0x%02X), forzando 0x08...", mixl);
-            tlv_write_reg(0x01, 0x0C, 0x08);
-            needs_recovery = true;
-        }
-        if (mixr != 0x08) {
-            ESP_LOGW(TAG, "Watchdog: MIXR incorrecto (0x%02X), forzando 0x08...", mixr);
-            tlv_write_reg(0x01, 0x0D, 0x08);
-            needs_recovery = true;
-        }
-    } else {
-        ESP_LOGW(TAG, "Watchdog: No se pueden leer mixers, aplicando fix forzado...");
-        tlv_write_reg(0x01, 0x0C, 0x08); // Force left mixer
-        tlv_write_reg(0x01, 0x0D, 0x08); // Force right mixer
-        needs_recovery = true;
-    }
-    
-    if (needs_recovery) {
-        ESP_LOGI(TAG, "Watchdog: Recovery operations completed");
-        vTaskDelay(pdMS_TO_TICKS(50)); // Allow recovery to settle
-    }
-    
-    return needs_recovery;
-}
-
-void tlv320_diagnose_and_fix_dropout_issues(void)
-{
-    ESP_LOGI(TAG, "=== TLV320 DROPOUT DIAGNOSIS & FIX ===");
-    
-    uint8_t hp_drv, out_rout, mixl, mixr, hpl_vol, hpr_vol;
-    bool needs_fix = false;
-    
-    // Read critical registers
-    if (tlv_read_reg(0x01, 0x1F, &hp_drv) != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot read HP driver register");
-        return;
-    }
-    
-    if (tlv_read_reg(0x01, 0x23, &out_rout) != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot read output routing register");
-        return;
-    }
-    
-    if (tlv_read_reg(0x01, 0x0C, &mixl) != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot read left mixer register");
-        return;
-    }
-    
-    if (tlv_read_reg(0x01, 0x0D, &mixr) != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot read right mixer register");
-        return;
-    }
-    
-    if (tlv_read_reg(0x01, 0x24, &hpl_vol) != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot read HPL volume register");
-        return;
-    }
-    
-    if (tlv_read_reg(0x01, 0x25, &hpr_vol) != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot read HPR volume register");
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Current register values:");
-    ESP_LOGI(TAG, "  HP_DRV(0x1F)=0x%02X (should be 0x03)", hp_drv);
-    ESP_LOGI(TAG, "  OUT_ROUT(0x23)=0x%02X (should be 0x50)", out_rout);
-    ESP_LOGI(TAG, "  MIXL_CFG(0x0C)=0x%02X (should be 0x08)", mixl);
-    ESP_LOGI(TAG, "  MIXR_CFG(0x0D)=0x%02X (should be 0x08)", mixr);
-    ESP_LOGI(TAG, "  HPL_VOL(0x24)=0x%02X (should be 0x80)", hpl_vol);
-    ESP_LOGI(TAG, "  HPR_VOL(0x25)=0x%02X (should be 0x80)", hpr_vol);
-    
-    // Fix HP driver issue (0x06 -> 0x03)
-    if (hp_drv != 0x03) {
-        ESP_LOGW(TAG, "Fixing HP driver register: 0x%02X -> 0x03", hp_drv);
-        tlv_write_reg(0x01, 0x1F, 0x03);
-        needs_fix = true;
-    }
-    
-    // CORRECCIÓN: Fix output routing (should be 0x44 para DAC→HP correcto)
-    if (out_rout != 0x44) {
-        ESP_LOGW(TAG, "Fixing output routing: 0x%02X -> 0x44 (DAC_L→HPL, DAC_R→HPR)", out_rout);
-        tlv_write_reg(0x01, 0x23, 0x44);
-        needs_fix = true;
-    }
-    
-    // Fix mixer routing (should be 0x08 for both)
-    if (mixl != 0x08) {
-        ESP_LOGW(TAG, "Fixing left mixer routing: 0x%02X -> 0x08", mixl);
-        tlv_write_reg(0x01, 0x0C, 0x08);
-        needs_fix = true;
-    }
-    
-    if (mixr != 0x08) {
-        ESP_LOGW(TAG, "Fixing right mixer routing: 0x%02X -> 0x08", mixr);
-        tlv_write_reg(0x01, 0x0D, 0x08);
-        needs_fix = true;
-    }
-    
-    // Fix HP volume enables (should be 0x80)
-    if (hpl_vol != 0x80) {
-        ESP_LOGW(TAG, "Fixing HPL volume enable: 0x%02X -> 0x80", hpl_vol);
-        tlv_write_reg(0x01, 0x24, 0x80);
-        needs_fix = true;
-    }
-    
-    if (hpr_vol != 0x80) {
-        ESP_LOGW(TAG, "Fixing HPR volume enable: 0x%02X -> 0x80", hpr_vol);
-        tlv_write_reg(0x01, 0x25, 0x80);
-        needs_fix = true;
-    }
-    
-    if (needs_fix) {
-        ESP_LOGI(TAG, "Dropout fixes applied - audio should recover");
-        vTaskDelay(pdMS_TO_TICKS(100)); // Allow changes to settle
-        
-        // Re-read and verify
-        ESP_LOGI(TAG, "Verifying fixes...");
-        tlv320_dump_debug();
-    } else {
-        ESP_LOGI(TAG, "All registers are correct - issue may be elsewhere");
-    }
-    
-    ESP_LOGI(TAG, "=== DROPOUT DIAGNOSIS COMPLETE ===");
-}
-
-bool tlv320_emergency_mixer_fix(void)
-{
-    ESP_LOGW(TAG, "=== EMERGENCY MIXER FIX ===");
-    ESP_LOGW(TAG, "Forcing correct mixer configuration for HeadphoneOutput");
-    
-    // Switch to Page 1
-    if (!tlv_write_ok(0x01, 0x00, 0x01)) {
-        ESP_LOGE(TAG, "Failed to switch to page 1 for emergency fix");
-        return false;
-    }
-    
-    // FORZAR directamente la configuración correcta sin leer primero
-    ESP_LOGW(TAG, "Escribiendo MIXL=0x08 (DAC_L to HPL mixer) FORZADO");
-    bool success1 = tlv_write_ok(0x01, 0x0C, 0x08);
-    
-    ESP_LOGW(TAG, "Escribiendo MIXR=0x08 (DAC_R to HPR mixer) FORZADO");
-    bool success2 = tlv_write_ok(0x01, 0x0D, 0x08);
-    
-    // CORRECCIÓN: HP drivers con bits correctos P1:R31=0xD0
-    ESP_LOGW(TAG, "Forzando HP drivers CORRECTO: P1:R31=0xD0 (bits D7/D6)");
-    bool success3 = tlv_write_ok(0x01, 0x1F, 0xD0);
-    
-    // Forzar HP output stages powered
-    ESP_LOGW(TAG, "Forzando HP output stages: P1:R9=0x30");
-    bool success4 = tlv_write_ok(0x01, 0x09, 0x30);
-    
-    // CORRECCIÓN: Routing correcto P1:R35=0x44
-    ESP_LOGW(TAG, "Forzando routing CORRECTO: P1:R35=0x44 (DAC→HP)");
-    bool success5 = tlv_write_ok(0x01, 0x23, 0x44);
-    
-    // CORRECCIÓN: HP PGAs unmuted P1:R40=0x06, P1:R41=0x06
-    ESP_LOGW(TAG, "Forzando HP PGAs UNMUTED: P1:R40=0x06, P1:R41=0x06");
-    bool success6 = tlv_write_ok(0x01, 0x28, 0x06);
-    bool success7 = tlv_write_ok(0x01, 0x29, 0x06);
-    
-    // Delay para que se apliquen los cambios
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    bool overall_success = success1 && success2 && success3 && success4 && success5 && success6 && success7;
-    
-    if (overall_success) {
-        ESP_LOGI(TAG, "✅ EMERGENCY FIX CON CORRECCIONES APLICADO COMPLETAMENTE");
-        ESP_LOGI(TAG, "✅ Mixers: 0x08, HP drivers: 0xD0, Output stages: 0x30, Routing: 0x44");
-        ESP_LOGI(TAG, "✅ HP PGAs: 0x06 (UNMUTED), TODAS LAS CORRECCIONES APLICADAS");
-        ESP_LOGI(TAG, "🎧 AUDIO DEBERÍA FUNCIONAR CORRECTAMENTE AHORA");
-    } else {
-        ESP_LOGE(TAG, "❌ EMERGENCY FIX PARCIALMENTE FALLIDO");
-        ESP_LOGE(TAG, "❌ Verificar conexiones I2C y alimentación del TLV320");
-    }
-    
-    return overall_success;
-}

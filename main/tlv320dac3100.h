@@ -36,24 +36,13 @@ bool tlv320_hardware_reset_and_init(int sample_rate);
 // Configure both headphone and speaker outputs with proper routing and volumes
 // Enables simultaneous output to both HP jack and Class-AB line outputs
 // For speaker: requires 5V supply on Adafruit 6309 board for adequate volume
+// Configure both headphone and speaker outputs.
+// Headphones: DAC_L->HPL, DAC_R->HPR at 0 dB.
+// Class-D: sums L+R in analog by enabling both routes with 0 dB and powers Class-D with gentle de-pop.
 bool tlv320_configure_dual_output(void);
 
 // Configure ONLY headphone output HPL/HPR with correct register mapping
 // Based on TLV320DAC3100 datasheet specifications for proper HP routing
+// Deprecated: Headphone-only path with conflicting clock assumptions. Prefer tlv320_configure_dual_output().
 bool tlv320_configure_headphone_only(void);
 
-// Advanced debugging and health check function
-// Monitors critical registers and provides detailed diagnostics
-void tlv320_advanced_debug_and_health_check(void);
-
-// Watchdog function to monitor and recover from audio dropouts
-// Call periodically to detect and fix audio path issues
-bool tlv320_audio_watchdog_check_and_recover(void);
-
-// Diagnose and fix specific problems based on logs
-// Specifically addresses dropout issues seen in user logs
-void tlv320_diagnose_and_fix_dropout_issues(void);
-
-// Emergency fix for mixer configuration problem
-// Forces correct mixer routing when DAC->HP path is broken
-bool tlv320_emergency_mixer_fix(void);

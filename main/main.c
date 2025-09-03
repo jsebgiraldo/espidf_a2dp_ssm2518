@@ -42,7 +42,7 @@
 #define TLV320_RESET_IO          33
 #endif
 
-// I2S salida hacia SSM2518 (I2S Philips, 16-bit samples en slots de 32-bit, estéreo)
+// I2S salida hacia SSM2518 (I2S Philips, 16-bit samples en slots de 16-bit, estéreo)
 // Ajusta estos pines según tu cableado hacia el PMOD AMP3
 #define I2S_BCLK_IO              26   // BCLK
 #define I2S_LRCK_IO              25   // LRCLK / WS
@@ -162,7 +162,10 @@ static void i2s_init(uint32_t sample_rate)
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL));
 
     // Configurar I2S: datos 16-bit y slots de 16-bit (BCLK=fs*32). Esto coincide con la asunción del TLV (PLL por BCLK).
-    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+    i2s_std_slot_config_t slot_cfg =
+    I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+    slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;  // Asegura BCLK=Fs*32
+    slot_cfg.bit_shift      = true;
     i2s_std_config_t std_cfg;
     memset(&std_cfg, 0, sizeof(std_cfg));
     std_cfg.clk_cfg = (i2s_std_clk_config_t) I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
@@ -181,9 +184,6 @@ static void i2s_init(uint32_t sample_rate)
     std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
-
-    ESP_LOGI(TAG, "I2S init: SR=%lu, ws_inv=%d, bclk_inv=%d", (unsigned long)sample_rate, (int)I2S_WS_INVERT, (int)I2S_BCLK_INVERT);
-
     if (!s_i2s_mutex) {
         s_i2s_mutex = xSemaphoreCreateMutex();
     }
@@ -346,22 +346,16 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         ESP_LOGI(TAG, "A2DP estado audio: %d", param->audio_stat.state);
         // Configurar TLV320 cuando comience la reproducción de audio
         if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED && s_tlv_active && !s_tlv_configured) {
-            ESP_LOGI(TAG, "Audio iniciado - configurando TLV320 EXCLUSIVAMENTE para HeadphoneOutput");
+            ESP_LOGI(TAG, "Audio iniciado - configurando TLV320 para DualOutput (HP + Class-D mono)");
             // Configurar clocks con sample rate por defecto
             if (tlv320_configure_bclk_i2s_16(44100)) {
-                // Configuración EXCLUSIVA para HeadphoneOutput HPL/HPR
-                if (tlv320_configure_headphone_only()) {
+                // Configuración DualOutput: HPL/HPR + Class-D sumando L+R en analógico
+                if (tlv320_configure_dual_output()) {
                     s_tlv_configured = true;
-                    ESP_LOGI(TAG, "✓ TLV320 configurado EXCLUSIVAMENTE para HeadphoneOutput HPL/HPR");
-                    ESP_LOGI(TAG, "✓ Routing: DAC_L -> HPL, DAC_R -> HPR");
-                    ESP_LOGI(TAG, "✓ Line outputs DESHABILITADOS");
-                    
-                    // Aplicar fix de emergencia inmediatamente para asegurar mixers correctos
-                    ESP_LOGI(TAG, "🔧 Aplicando fix preventivo de mixers...");
-                    tlv320_emergency_mixer_fix();
-                    
+                    ESP_LOGI(TAG, "✓ TLV320 configurado en DualOutput: HPL/HPR + Class-D (L+R analógico)");
+                    ESP_LOGI(TAG, "✓ Routing HP: DAC_L -> HPL, DAC_R -> HPR; Class-D: L y R sumados");
                 } else {
-                    ESP_LOGE(TAG, "✗ FALLO en configuración HeadphoneOutput - verificar conexiones I2C");
+                    ESP_LOGE(TAG, "✗ FALLO en configuración DualOutput - verificar conexiones I2C y SPKVDD=5V");
                     ESP_LOGE(TAG, "✗ No se intentarán configuraciones alternativas");
                 }
             } else {
@@ -380,36 +374,6 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             else if (oct0 & (1 << 4)) sample_rate = 48000;
             ESP_LOGI(TAG, "A2DP SBC sample_rate=%d", sample_rate);
             i2s_set_sample_rate(sample_rate);
-            // Si usamos TLV sin MCLK, reconfigurar PLL desde BCLK para la nueva tasa
-            if (s_tlv_active) {
-                if (s_tlv_configured) {
-                    ESP_LOGI(TAG, "Actualizando sample rate del TLV320: %d", sample_rate);
-                    if (!tlv320_configure_bclk_i2s_16(sample_rate)) {
-                        ESP_LOGW(TAG, "Failed to update TLV320 sample rate");
-                    }
-                } else {
-                    ESP_LOGI(TAG, "Configurando TLV320 para sample rate: %d", sample_rate);
-                    if (!tlv320_configure_bclk_i2s_16(sample_rate)) {
-                        ESP_LOGW(TAG, "Failed to configure TLV320 clocks for new sample rate");
-                    } else {
-                        // Configuración EXCLUSIVA para HeadphoneOutput al cambiar sample rate
-                        ESP_LOGI(TAG, "Reconfigurando TLV320 EXCLUSIVAMENTE para HeadphoneOutput");
-                        if (tlv320_configure_headphone_only()) {
-                            s_tlv_configured = true;
-                            ESP_LOGI(TAG, "✓ HeadphoneOutput reconfigurado exitosamente para nuevo sample rate");
-                            
-                            // Aplicar fix preventivo de mixers después de reconfiguración
-                            ESP_LOGI(TAG, "🔧 Aplicando fix preventivo de mixers post-reconfiguración...");
-                            tlv320_emergency_mixer_fix();
-                            
-                        } else {
-                            ESP_LOGE(TAG, "✗ FALLO en reconfiguración HeadphoneOutput");
-                            ESP_LOGE(TAG, "✗ No se usarán configuraciones alternativas");
-                            s_tlv_configured = false;
-                        }
-                    }
-                }
-            }
         }
         break;
     default:
@@ -565,9 +529,4 @@ void app_main(void)
     // Inicializar Bluetooth y A2DP Sink
     ESP_LOGI(TAG, "Inicializando Bluetooth A2DP Sink...");
     bluetooth_a2dp_sink_init();
-
-    // Bucle mínimo
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
 }
