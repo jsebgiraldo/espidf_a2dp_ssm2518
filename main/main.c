@@ -65,7 +65,12 @@ static TaskHandle_t s_i2s_writer_task = NULL;
 static uint8_t s_silence[1024] = {0};
 static volatile size_t s_rx_bytes = 0;
 static volatile size_t s_tx_bytes = 0;
-static TaskHandle_t s_audio_stats_task = NULL;
+#if 0
+// (optional audio stats task removed)
+#endif
+static TaskHandle_t s_tone_task = NULL;
+static float s_tone_freq = 1000.0f;
+static float s_tone_amp = 0.5f; // 0..1 (full-scale)
 static bool s_tlv_active = false;
 static bool s_tlv_configured = false;
 static bool s_have_last_bda = false;
@@ -74,8 +79,60 @@ static esp_bd_addr_t s_last_bda = {0};
 static TaskHandle_t s_uart_cli_task = NULL;
 // Forward declaration for CLI task
 static void uart_cli_task(void *arg);
+// Forward declaration for tone task
+static void tone_task(void *arg);
+// Forward declaration for PCM writer used by tone_task
+static size_t i2s_write_pcm(const uint8_t *data, size_t len, uint32_t timeout_ms);
+
+// Weak fallback: if driver object doesn't provide tlv320_print_status,
+// this stub will satisfy the linker and print a minimal snapshot.
+// When the real function exists in the driver, it will override this weak one.
+void __attribute__((weak)) tlv320_print_status(void)
+{
+    uint8_t v = 0;
+    esp_err_t e;
+    // Try reading a few key regs to prove bus access works
+    e = tlv320_reg_read(0x00, 0x1B, &v); // IF_CTRL1
+    if (e == ESP_OK) {
+        ESP_LOGI(TAG, "[weak] TLV IF_CTRL1(0x1B)=0x%02X", v);
+    } else {
+        ESP_LOGW(TAG, "[weak] TLV read failed: %s", esp_err_to_name(e));
+        return;
+    }
+    if (tlv320_reg_read(0x00, 0x04, &v) == ESP_OK) ESP_LOGI(TAG, "[weak] P0 R4(ClockSel)=0x%02X", v);
+    if (tlv320_reg_read(0x00, 0x05, &v) == ESP_OK) ESP_LOGI(TAG, "[weak] P0 R5(PLL PR)=0x%02X", v);
+    if (tlv320_reg_read(0x00, 0x06, &v) == ESP_OK) ESP_LOGI(TAG, "[weak] P0 R6(PLL J)=0x%02X", v);
+    if (tlv320_reg_read(0x00, 0x0B, &v) == ESP_OK) ESP_LOGI(TAG, "[weak] P0 R11(NDAC)=0x%02X", v);
+    if (tlv320_reg_read(0x00, 0x0C, &v) == ESP_OK) ESP_LOGI(TAG, "[weak] P0 R12(MDAC)=0x%02X", v);
+    if (tlv320_reg_read(0x00, 0x0E, &v) == ESP_OK) ESP_LOGI(TAG, "[weak] P0 R14(DOSR LSB)=0x%02X", v);
+}
 
 // (sin duplicado L/R por software)
+
+// Simple tone generator task writing directly to I2S (16-bit stereo)
+static void tone_task(void *arg)
+{
+    const uint32_t sr = s_current_sample_rate;
+    const size_t frames = 256;
+    int16_t buf[frames*2];
+    float phase = 0.0f;
+    for (;;) {
+        float freq = s_tone_freq;
+        float amp = s_tone_amp;
+        const float PI2 = 6.28318530717958647692f;
+        float step = PI2 * freq / (float)sr;
+        for (size_t i=0;i<frames;i++) {
+            float s = sinf(phase) * amp;
+            int16_t v = (int16_t)(s * 32767.0f);
+            buf[2*i+0] = v;
+            buf[2*i+1] = v;
+            phase += step;
+            if (phase > PI2) phase -= PI2;
+        }
+        (void)i2s_write_pcm((uint8_t*)buf, sizeof(buf), 1000);
+        vTaskDelay(1);
+    }
+}
 
 // --------------- I2C -----------------
 static void i2c_master_init(void)
@@ -204,21 +261,9 @@ static void i2s_init(uint32_t sample_rate)
     }
 }
 
-static void audio_stats_task(void *arg)
-{
-    size_t last_rx = 0, last_tx = 0;
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        size_t rx = s_rx_bytes;
-        size_t tx = s_tx_bytes;
-        size_t drx = rx - last_rx;
-        size_t dtx = tx - last_tx;
-        last_rx = rx;
-        last_tx = tx;
-        
-        ESP_LOGI(TAG, "Audio stats: RX %.1f kB/s, TX %.1f kB/s", drx / 1024.0f, dtx / 1024.0f);
-    }
-}
+#if 0
+// (optional audio stats task removed)
+#endif
 
 static void i2s_set_sample_rate(uint32_t sample_rate)
 {
@@ -247,6 +292,7 @@ static size_t i2s_write_pcm(const uint8_t *data, size_t len, uint32_t timeout_ms
     }
     return bytes_written;
 }
+
 
 static void i2s_writer_task(void *arg)
 {
@@ -572,9 +618,15 @@ static void print_cli_help(void)
         "  tlv wr <page> <reg> <val>    - Escribir reg (hex: p rr vv)\r\n"
         "  tlv hp                        - Configurar Headphone only\r\n"
         "  tlv dual                      - Configurar DualOutput (HP+SPK)\r\n"
+        "  tlv default                   - Configuración base por defecto (HP)\r\n"
         "  tlv reset                     - Reset hardware+reinit (44100)\r\n"
+    "  tlv autofix [44100|48000]     - Auto-fix Page0 clocks I2S16\r\n"
+    "  tlv status                    - Estado/derivados de clocks y ruteos\r\n"
         "  vol dac <L|R|both> <0-255>    - Volumen digital DAC\r\n"
         "  vol hp <L|R|both> <0-127|0x80>- Volumen HP analog (0x80=0dB)\r\n"
+    "  tone on [freq] [amp0-1]       - Genera seno interno\r\n"
+    "  tone off                      - Detiene tono interno\r\n"
+    "  sweep vol <dac|hp>            - Recorre volumen y emite CSV\r\n"
         "\r\n";
     uart_write_bytes(UART_NUM_0, help, strlen(help));
 }
@@ -648,7 +700,7 @@ static void uart_cli_task(void *arg)
                     print_cli_help();
                 } else if (!strcasecmp(cmd, "tlv")) {
                     char *sub = strtok(NULL, " \t");
-                    if (!sub) { write_line("\r\nUso: tlv <dump|rd|wr|hp|dual|reset>\r\n"); }
+                    if (!sub) { write_line("\r\nUso: tlv <dump|rd|wr|hp|dual|default|reset|status>\r\n"); }
                     else if (!strcasecmp(sub, "dump")) {
                         tlv320_dump_debug_public();
                         write_line("\r\nHecho\r\n");
@@ -681,9 +733,20 @@ static void uart_cli_task(void *arg)
                     } else if (!strcasecmp(sub, "dual")) {
                         bool ok = tlv320_configure_dual_output();
                         write_line("\r\nDual %s\r\n", ok?"OK":"ERR");
+                    } else if (!strcasecmp(sub, "default")) {
+                        bool ok = tlv320_configure_default();
+                        write_line("\r\nDefault %s\r\n", ok?"OK":"ERR");
                     } else if (!strcasecmp(sub, "reset")) {
                         bool ok = tlv320_hardware_reset_and_init(44100);
                         write_line("\r\nReset %s\r\n", ok?"OK":"ERR");
+                    } else if (!strcasecmp(sub, "autofix")) {
+                        char *rs = strtok(NULL, " \t");
+                        int sr = rs ? (int)strtoul(rs, NULL, 0) : 44100;
+                        bool ok = tlv320_autofix_page0_for_i2s16(sr, true);
+                        write_line("\r\nAutoFix %s\r\n", ok?"OK":"ERR");
+                    } else if (!strcasecmp(sub, "status")) {
+                        tlv320_print_status();
+                        write_line("\r\nHecho\r\n");
                     } else {
                         write_line("\r\nSubcomando tlv desconocido\r\n");
                     }
@@ -708,7 +771,49 @@ static void uart_cli_task(void *arg)
                         write_line("\r\nUso: vol <dac|hp> <L|R|both> <val>\r\n");
                     }
                 } else {
+                    // Tone and sweep commands
+                    if (!strcasecmp(cmd, "tone")) {
+                        char *sub = strtok(NULL, " \t");
+                        if (sub && !strcasecmp(sub, "on")) {
+                            char *sf = strtok(NULL, " \t");
+                            char *sa = strtok(NULL, " \t");
+                            if (sf) s_tone_freq = (float)atof(sf);
+                            if (sa) s_tone_amp = (float)atof(sa);
+                            if (s_tone_task == NULL) {
+                                xTaskCreatePinnedToCore(tone_task, "tone", 2048, NULL, tskIDLE_PRIORITY+2, &s_tone_task, 1);
+                            }
+                            write_line("\r\nTone ON f=%.1fHz amp=%.2f\r\n", s_tone_freq, s_tone_amp);
+                        } else if (sub && !strcasecmp(sub, "off")) {
+                            if (s_tone_task) {
+                                vTaskDelete(s_tone_task); s_tone_task = NULL;
+                            }
+                            write_line("\r\nTone OFF\r\n");
+                        } else {
+                            write_line("\r\nUso: tone on [freq] [amp0-1] | tone off\r\n");
+                        }
+                    } else if (!strcasecmp(cmd, "sweep")) {
+                        char *what = strtok(NULL, " \t");
+                        if (!what || (strcasecmp(what, "dac") && strcasecmp(what, "hp"))) {
+                            write_line("\r\nUso: sweep vol <dac|hp>\r\n");
+                        } else {
+                            write_line("\r\n#type,reg,val,comment\r\n");
+                            if (!strcasecmp(what, "dac")) {
+                                for (int v=0; v<=0x7F; v+=8) {
+                                    tlv320_reg_write(0x00, 0x41, (uint8_t)v);
+                                    tlv320_reg_write(0x00, 0x42, (uint8_t)v);
+                                    write_line("dac,0x41,0x%02X,L 0dB=%d\r\n", v, v==0);
+                                }
+                            } else {
+                                for (int v=0x80; v<=0xFF; v+=8) {
+                                    tlv320_reg_write(0x01, 0x24, (uint8_t)v);
+                                    tlv320_reg_write(0x01, 0x25, (uint8_t)v);
+                                    write_line("hp,0x24,0x%02X,0x80=0dB\r\n", v);
+                                }
+                            }
+                        }
+                    } else {
                     write_line("\r\nComando desconocido. Escribe 'help'\r\n");
+                    }
                 }
                 write_line("> ");
             } else if (ch == 0x7F || ch == '\b') {

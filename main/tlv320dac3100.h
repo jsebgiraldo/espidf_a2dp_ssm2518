@@ -27,7 +27,7 @@ bool tlv320_configure_basic_i2s_16bit(bool enable_speaker);
 bool tlv320_configure_bclk_i2s_16(int sample_rate);
 
 // Enable HP/Line-Out path on the TLV320DAC3100 and set maximum analog volume (0 dB).
-// Routes both DAC channels to HPL/HPR and powers the HP drivers. DAC3100 has no Class-D.
+// Routes both DAC channels to HPL/HPR and powers the HP drivers. Speaker path depends on board design.
 bool tlv320_enable_speaker_out_max(void);
 
 // Perform hardware reset via GPIO pin (if configured) followed by full re-initialization
@@ -43,10 +43,34 @@ bool tlv320_configure_dual_output(void);
 // Based on TLV320DAC3100 datasheet specifications for proper HP routing
 bool tlv320_configure_headphone_only(void);
 
+// Default baseline configuration: conservative, minimal setup to get audio out
+// of headphone outputs (HPL/HPR) using I2S 16-bit clocks from BCLK.
+// It programs Page 0 clocks (PLL from BCLK, NDAC/MDAC/DOSR), selects PRB_P1,
+// enables DAC datapath and powers headphone analog path at 0 dB.
+// Returns true on success.
+bool tlv320_configure_default(void);
+
+// Enhanced configuration for best audio quality at 44.1/48 kHz, I2S 16-bit.
+// - PLL from BCLK with stable dividers (slots=16-bit => BCLK=Fs*32)
+// - Processing block PRB_P1
+// - Smooth pop-free ramp, DAC at 0 dB, HP PGAs at 0 dB
+// - Stereo headphones (HPL/HPR) + mono speaker (L+R summed to left analog path)
+// Returns true on success.
+// (reserved) bool tlv320_configure_enhanced(int sample_rate);
+
+// Print a summarized status: clock source, PLL params, NDAC/MDAC/DOSR, I2S format,
+// derived BCLK/LRCLK ratio expectation and warnings if mismatched.
+void tlv320_print_status(void);
+
 // --- UART/Debug helpers ---
 // Public wrappers to read/write a TLV register (page/reg) and dump a small debug set.
 // These are thin wrappers around the internal I2C accessors used by the driver.
 esp_err_t tlv320_reg_read(uint8_t page, uint8_t reg, uint8_t *val_out);
 esp_err_t tlv320_reg_write(uint8_t page, uint8_t reg, uint8_t val);
 void tlv320_dump_debug_public(void);
+
+// Auto-fix Page 0 clocks for I2S 16-bit (BCLK = Fs * 32). Reads current regs and
+// reprograms 0x04, 0x05..0x08, 0x0B..0x0E, 0x1B..0x1D, 0x3C in a safe order.
+// sample_rate supported: 44100 or 48000. Returns true on success.
+bool tlv320_autofix_page0_for_i2s16(int sample_rate, bool verbose);
 
