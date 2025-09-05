@@ -3,6 +3,9 @@
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <strings.h>
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,6 +24,8 @@
 #include "driver/gpio.h"
 // I2S (STD driver v2)
 #include "driver/i2s_std.h"
+// UART console
+#include "driver/uart.h"
 // Bluetooth A2DP Sink
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -65,6 +70,10 @@ static bool s_tlv_active = false;
 static bool s_tlv_configured = false;
 static bool s_have_last_bda = false;
 static esp_bd_addr_t s_last_bda = {0};
+// UART task handle
+static TaskHandle_t s_uart_cli_task = NULL;
+// Forward declaration for CLI task
+static void uart_cli_task(void *arg);
 
 // (sin duplicado L/R por software)
 
@@ -521,12 +530,201 @@ void app_main(void)
             ESP_LOGE(TAG, "No se pudo crear i2s_writer_task");
         }
         // Tarea de estadísticas (opcional)
+        #if 0
         if (s_audio_stats_task == NULL) {
             xTaskCreatePinnedToCore(audio_stats_task, "audio_stats", 2048, NULL, tskIDLE_PRIORITY+1, &s_audio_stats_task, 0);
         }
+        #endif
     }
 
     // Inicializar Bluetooth y A2DP Sink
     ESP_LOGI(TAG, "Inicializando Bluetooth A2DP Sink...");
     bluetooth_a2dp_sink_init();
+
+    // Iniciar CLI por UART0
+    if (s_uart_cli_task == NULL) {
+        // Configurar UART0 para consola interactiva
+        uart_config_t ucfg = {
+            .baud_rate = 115200,
+            .data_bits = UART_DATA_8_BITS,
+            .parity    = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .source_clk = UART_SCLK_DEFAULT,
+        };
+        ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 2048, 0, 0, NULL, 0));
+        ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &ucfg));
+        ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+        xTaskCreatePinnedToCore(uart_cli_task, "uart_cli", 4096, NULL, tskIDLE_PRIORITY+2, &s_uart_cli_task, 0);
+    }
+}
+
+// --- UART CLI implementation ---
+static void print_cli_help(void)
+{
+    const char *help =
+        "\r\nTLV320 CLI comandos:\r\n"
+        "  help                         - Mostrar ayuda\r\n"
+        "  tlv dump                     - Dump rápido de registros útiles\r\n"
+        "  tlv rd <page> <reg>          - Leer reg (hex: p rr)\r\n"
+        "  tlv wr <page> <reg> <val>    - Escribir reg (hex: p rr vv)\r\n"
+        "  tlv hp                        - Configurar Headphone only\r\n"
+        "  tlv dual                      - Configurar DualOutput (HP+SPK)\r\n"
+        "  tlv reset                     - Reset hardware+reinit (44100)\r\n"
+        "  vol dac <L|R|both> <0-255>    - Volumen digital DAC\r\n"
+        "  vol hp <L|R|both> <0-127|0x80>- Volumen HP analog (0x80=0dB)\r\n"
+        "\r\n";
+    uart_write_bytes(UART_NUM_0, help, strlen(help));
+}
+
+static uint8_t parse_hex_byte(const char *s)
+{
+    unsigned v = 0;
+    if (strncasecmp(s, "0x", 2) == 0) s += 2;
+    sscanf(s, "%x", &v);
+    return (uint8_t)(v & 0xFF);
+}
+
+static void write_line(const char *fmt, ...)
+{
+    char buf[160];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof(buf)) n = sizeof(buf);
+    uart_write_bytes(UART_NUM_0, buf, n);
+}
+
+static void uart_cli_task(void *arg)
+{
+    print_cli_help();
+    char line[128];
+    char last_cmd[128];
+    size_t idx = 0;
+    size_t last_len = 0;
+    int esc_state = 0; // 0: none, 1: got ESC, 2: got ESC[
+    write_line("> ");
+    for (;;) {
+        uint8_t ch;
+        int r = uart_read_bytes(UART_NUM_0, &ch, 1, pdMS_TO_TICKS(50));
+        if (r == 1) {
+            // Handle ANSI escape sequences for arrow keys
+            if (esc_state == 0 && ch == 0x1B) { esc_state = 1; continue; }
+            if (esc_state == 1) { esc_state = (ch == '[') ? 2 : 0; continue; }
+            if (esc_state == 2) {
+                // Arrow keys: A=Up, B=Down, C=Right, D=Left (we only use Up/Down)
+                if (ch == 'A') {
+                    // Recall last command
+                    if (last_len > 0) {
+                        memcpy(line, last_cmd, last_len);
+                        idx = last_len;
+                        // Erase line and redraw prompt + content
+                        write_line("\r\x1b[2K> ");
+                        uart_write_bytes(UART_NUM_0, line, idx);
+                    }
+                } else if (ch == 'B') {
+                    // Clear current line
+                    idx = 0; line[0] = '\0';
+                    write_line("\r\x1b[2K> ");
+                }
+                esc_state = 0; continue;
+            }
+
+            if (ch == '\r' || ch == '\n') {
+                // End of line
+                uart_write_bytes(UART_NUM_0, "\r\n", 2);
+                line[idx] = '\0';
+                // Save to history if not empty
+                if (idx > 0) { memcpy(last_cmd, line, idx+1); last_len = idx; }
+                idx = 0;
+                if (line[0] == '\0') { write_line("> "); continue; }
+                // Parse command
+                char *cmd = strtok(line, " \t");
+                if (!cmd) { write_line("\r\n> "); continue; }
+                if (!strcasecmp(cmd, "help")) {
+                    print_cli_help();
+                } else if (!strcasecmp(cmd, "tlv")) {
+                    char *sub = strtok(NULL, " \t");
+                    if (!sub) { write_line("\r\nUso: tlv <dump|rd|wr|hp|dual|reset>\r\n"); }
+                    else if (!strcasecmp(sub, "dump")) {
+                        tlv320_dump_debug_public();
+                        write_line("\r\nHecho\r\n");
+                    } else if (!strcasecmp(sub, "rd")) {
+                        char *ps = strtok(NULL, " \t");
+                        char *rs = strtok(NULL, " \t");
+                        if (!ps || !rs) { write_line("\r\nUso: tlv rd <page> <reg>\r\n"); }
+                        else {
+                            uint8_t p = parse_hex_byte(ps);
+                            uint8_t r = parse_hex_byte(rs);
+                            uint8_t v; esp_err_t e = tlv320_reg_read(p, r, &v);
+                            if (e == ESP_OK) write_line("\r\nP%u R0x%02X = 0x%02X\r\n", p, r, v);
+                            else write_line("\r\nError: %s\r\n", esp_err_to_name(e));
+                        }
+                    } else if (!strcasecmp(sub, "wr")) {
+                        char *ps = strtok(NULL, " \t");
+                        char *rs = strtok(NULL, " \t");
+                        char *vs = strtok(NULL, " \t");
+                        if (!ps || !rs || !vs) { write_line("\r\nUso: tlv wr <page> <reg> <val>\r\n"); }
+                        else {
+                            uint8_t p = parse_hex_byte(ps);
+                            uint8_t r = parse_hex_byte(rs);
+                            uint8_t v = parse_hex_byte(vs);
+                            esp_err_t e = tlv320_reg_write(p, r, v);
+                            write_line("\r\n%s\r\n", e==ESP_OK?"OK":"ERR");
+                        }
+                    } else if (!strcasecmp(sub, "hp")) {
+                        bool ok = tlv320_configure_headphone_only();
+                        write_line("\r\nHeadphone %s\r\n", ok?"OK":"ERR");
+                    } else if (!strcasecmp(sub, "dual")) {
+                        bool ok = tlv320_configure_dual_output();
+                        write_line("\r\nDual %s\r\n", ok?"OK":"ERR");
+                    } else if (!strcasecmp(sub, "reset")) {
+                        bool ok = tlv320_hardware_reset_and_init(44100);
+                        write_line("\r\nReset %s\r\n", ok?"OK":"ERR");
+                    } else {
+                        write_line("\r\nSubcomando tlv desconocido\r\n");
+                    }
+                } else if (!strcasecmp(cmd, "vol")) {
+                    char *which = strtok(NULL, " \t");
+                    char *chsel = strtok(NULL, " \t");
+                    char *val = strtok(NULL, " \t");
+                    if (!which || !chsel || !val) { write_line("\r\nUso: vol <dac|hp> <L|R|both> <val>\r\n"); }
+                    else if (!strcasecmp(which, "dac")) {
+                        uint8_t vv = (uint8_t)strtoul(val, NULL, 0);
+                        bool both = !strcasecmp(chsel, "both");
+                        if (both || !strcasecmp(chsel, "L")) tlv320_reg_write(0x00, 0x41, vv);
+                        if (both || !strcasecmp(chsel, "R")) tlv320_reg_write(0x00, 0x42, vv);
+                        write_line("\r\nDAC vol set\r\n");
+                    } else if (!strcasecmp(which, "hp")) {
+                        uint8_t vv = (uint8_t)strtoul(val, NULL, 0);
+                        bool both = !strcasecmp(chsel, "both");
+                        if (both || !strcasecmp(chsel, "L")) tlv320_reg_write(0x01, 0x24, vv);
+                        if (both || !strcasecmp(chsel, "R")) tlv320_reg_write(0x01, 0x25, vv);
+                        write_line("\r\nHP vol set\r\n");
+                    } else {
+                        write_line("\r\nUso: vol <dac|hp> <L|R|both> <val>\r\n");
+                    }
+                } else {
+                    write_line("\r\nComando desconocido. Escribe 'help'\r\n");
+                }
+                write_line("> ");
+            } else if (ch == 0x7F || ch == '\b') {
+                if (idx) {
+                    idx--;
+                    // Erase on terminal
+                    uart_write_bytes(UART_NUM_0, "\b \b", 3);
+                }
+            } else if (ch >= 0x20 && ch <= 0x7E) { // printable
+                if (idx < sizeof(line)-1) {
+                    line[idx++] = (char)ch;
+                    uart_write_bytes(UART_NUM_0, (const char *)&ch, 1);
+                }
+            } else {
+                // ignore other control chars
+            }
+        }
+    }
 }

@@ -183,6 +183,22 @@ static bool tlv_write_ok(uint8_t page, uint8_t reg, uint8_t val)
     return tlv_write_reg(page, reg, val) == ESP_OK;
 }
 
+// --- Public wrappers for CLI ---
+esp_err_t tlv320_reg_read(uint8_t page, uint8_t reg, uint8_t *val_out)
+{
+    return tlv_read_reg(page, reg, val_out);
+}
+
+esp_err_t tlv320_reg_write(uint8_t page, uint8_t reg, uint8_t val)
+{
+    return tlv_write_reg(page, reg, val);
+}
+
+void tlv320_dump_debug_public(void)
+{
+    tlv320_dump_debug();
+}
+
 bool tlv320_configure_bclk_i2s_16(int sample_rate)
 {
     // Configuración completa para TLV320DAC3100 usando BCLK como fuente PLL
@@ -390,6 +406,25 @@ bool tlv320_configure_dual_output(void)
     tlv_write_ok(0x00, 0x40, 0x00);          // Unmute DACs
     tlv_write_ok(0x00, 0x41, 0x10);          // -8 dB digital (arranque)
     tlv_write_ok(0x00, 0x42, 0x10);
+
+    // I2S format: 16-bit word length, I²S (Philips), codec is slave for BCLK/LRCLK
+    tlv_write_ok(0x00, 0x1B, 0x00); // P0/R27: I²S + 16-bit
+    tlv_write_ok(0x00, 0x1C, 0x00); // P0/R28: data offset = 0 (I²S adds the 1-bit delay)
+    tlv_write_ok(0x00, 0x1D, 0x01); // P0/R29: BCLK/WCLK as inputs
+
+     // Clock source: use PLL referenced from BCLK, and use PLL as CODEC_CLKIN
+    tlv_write_ok(0x00, 0x04, 0x07); // P0/R4: PLL ref=BCLK, CODEC_CLKIN=PLL
+
+    // PLL = 32 × BCLK  (P=1, R=1, J=32, D=0)
+    tlv_write_ok(0x00, 0x05, 0x91); // P0/R5: power PLL, P=1, R=1
+
+    // tlv wr 0 06 80
+    // tlv wr 0 05 91
+
+
+    tlv_write_ok(0x00, 0x06, 0x20); // P0/R6: J=32
+    tlv_write_ok(0x00, 0x07, 0x00); // P0/R7: D MSB
+    tlv_write_ok(0x00, 0x08, 0x00); // P0/R8: D LSB
 
     // --- PAGE 1: potencia analógica y ruteos ---
     tlv_write_ok(0x01, 0x01, 0x08);          // Disable weak AVDD

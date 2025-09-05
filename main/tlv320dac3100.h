@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "esp_err.h"
 
 // Minimal TLV320DAC3100 scaffold
 // - Detect typical I2C addresses
@@ -36,13 +37,16 @@ bool tlv320_hardware_reset_and_init(int sample_rate);
 // Configure both headphone and speaker outputs with proper routing and volumes
 // Enables simultaneous output to both HP jack and Class-AB line outputs
 // For speaker: requires 5V supply on Adafruit 6309 board for adequate volume
-// Configure both headphone and speaker outputs.
-// Headphones: DAC_L->HPL, DAC_R->HPR at 0 dB.
-// Class-D: sums L+R in analog by enabling both routes with 0 dB and powers Class-D with gentle de-pop.
 bool tlv320_configure_dual_output(void);
 
 // Configure ONLY headphone output HPL/HPR with correct register mapping
 // Based on TLV320DAC3100 datasheet specifications for proper HP routing
-// Deprecated: Headphone-only path with conflicting clock assumptions. Prefer tlv320_configure_dual_output().
 bool tlv320_configure_headphone_only(void);
+
+// --- UART/Debug helpers ---
+// Public wrappers to read/write a TLV register (page/reg) and dump a small debug set.
+// These are thin wrappers around the internal I2C accessors used by the driver.
+esp_err_t tlv320_reg_read(uint8_t page, uint8_t reg, uint8_t *val_out);
+esp_err_t tlv320_reg_write(uint8_t page, uint8_t reg, uint8_t val);
+void tlv320_dump_debug_public(void);
 
