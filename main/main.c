@@ -26,6 +26,8 @@
 #include "driver/i2s_std.h"
 // UART console
 #include "driver/uart.h"
+// Binary UART protocol
+#include "serial_proto.h"
 // Bluetooth A2DP Sink
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -34,6 +36,8 @@
 #include "esp_a2dp_api.h"
 // TLV320DAC3100 driver (scaffold)
 #include "tlv320dac3100.h"
+// A2DP status export
+#include "a2dp_status.h"
 
 // --------- Configuración de pines ---------
 // I2C
@@ -75,6 +79,8 @@ static bool s_tlv_active = false;
 static bool s_tlv_configured = false;
 static bool s_have_last_bda = false;
 static esp_bd_addr_t s_last_bda = {0};
+static uint8_t s_a2dp_connected = 0; // 0/1
+static uint8_t s_a2dp_audio_state = 0; // esp_a2d_audio_state_t
 // UART task handle
 static TaskHandle_t s_uart_cli_task = NULL;
 // Forward declaration for CLI task
@@ -382,6 +388,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     switch (event) {
     case ESP_A2D_CONNECTION_STATE_EVT:
         ESP_LOGI(TAG, "A2DP estado conexión: %d", param->conn_stat.state);
+    s_a2dp_connected = (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) ? 1 : 0;
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             // Guardar BDA del último dispositivo conectado
 #ifdef CONFIG_IDF_TARGET
@@ -395,28 +402,23 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 ESP_LOGI(TAG, "A2DP conectado a %02X:%02X:%02X:%02X:%02X:%02X (guardado)",
                          bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
             }
+
+            // Configuración por defecto al conectar A2DP (presets desde UI posteriormente)
+            if (s_tlv_active) {
+                ESP_LOGI(TAG, "Aplicando preset por defecto (HP baseline) al conectar A2DP");
+                if (tlv320_configure_bclk_i2s_16(44100)) {
+                    (void)tlv320_configure_default();
+                    s_tlv_configured = true;
+                } else {
+                    ESP_LOGW(TAG, "No se pudo configurar clocks TLV por defecto");
+                }
+            }
         }
         break;
     case ESP_A2D_AUDIO_STATE_EVT:
         ESP_LOGI(TAG, "A2DP estado audio: %d", param->audio_stat.state);
-        // Configurar TLV320 cuando comience la reproducción de audio
-        if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED && s_tlv_active && !s_tlv_configured) {
-            ESP_LOGI(TAG, "Audio iniciado - configurando TLV320 para DualOutput (HP + Class-D mono)");
-            // Configurar clocks con sample rate por defecto
-            if (tlv320_configure_bclk_i2s_16(44100)) {
-                // Configuración DualOutput: HPL/HPR + Class-D sumando L+R en analógico
-                if (tlv320_configure_dual_output()) {
-                    s_tlv_configured = true;
-                    ESP_LOGI(TAG, "✓ TLV320 configurado en DualOutput: HPL/HPR + Class-D (L+R analógico)");
-                    ESP_LOGI(TAG, "✓ Routing HP: DAC_L -> HPL, DAC_R -> HPR; Class-D: L y R sumados");
-                } else {
-                    ESP_LOGE(TAG, "✗ FALLO en configuración DualOutput - verificar conexiones I2C y SPKVDD=5V");
-                    ESP_LOGE(TAG, "✗ No se intentarán configuraciones alternativas");
-                }
-            } else {
-                ESP_LOGE(TAG, "✗ FALLO en configuración de clocks I2S");
-            }
-        }
+    s_a2dp_audio_state = (uint8_t)param->audio_stat.state;
+        // No aplicar presets automáticamente aquí; la UI controlará los presets vía UART
         break;
     case ESP_A2D_AUDIO_CFG_EVT:
         ESP_LOGI(TAG, "A2DP audio cfg (codec=%d)", param->audio_cfg.mcc.type);
@@ -434,6 +436,18 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     default:
         break;
     }
+}
+
+void a2dp_get_status(a2dp_status_t *out)
+{
+    if (!out) return;
+    out->connected = s_a2dp_connected;
+    out->audio_state = s_a2dp_audio_state;
+    out->sample_rate = s_current_sample_rate;
+    out->rx_bytes = (uint32_t)s_rx_bytes;
+    out->tx_bytes = (uint32_t)s_tx_bytes;
+    out->have_last_bda = s_have_last_bda ? 1 : 0;
+    memcpy(out->last_bda, s_last_bda, sizeof(s_last_bda));
 }
 
 static void bluetooth_a2dp_sink_init(void)
@@ -491,7 +505,7 @@ static void bluetooth_a2dp_sink_init(void)
     ESP_ERROR_CHECK(esp_a2d_sink_register_data_callback(&bt_app_a2d_data_cb));
     ESP_ERROR_CHECK(esp_a2d_sink_init());
 
-    const char *dev_name = "ESP32 A2DP SEBAS";
+    const char *dev_name = "ESP32 A2DP MAX";
     ESP_ERROR_CHECK(esp_bt_gap_set_device_name(dev_name));
     ESP_ERROR_CHECK(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
 
@@ -627,6 +641,7 @@ static void print_cli_help(void)
     "  tone on [freq] [amp0-1]       - Genera seno interno\r\n"
     "  tone off                      - Detiene tono interno\r\n"
     "  sweep vol <dac|hp>            - Recorre volumen y emite CSV\r\n"
+    "  proto on|off                  - Inicia/detiene protocolo binario(Qt)\r\n"
         "\r\n";
     uart_write_bytes(UART_NUM_0, help, strlen(help));
 }
@@ -660,6 +675,11 @@ static void uart_cli_task(void *arg)
     int esc_state = 0; // 0: none, 1: got ESC, 2: got ESC[
     write_line("> ");
     for (;;) {
+        // If binary protocol is running on this UART, pause CLI input handling
+        if (serial_proto_is_running()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         uint8_t ch;
         int r = uart_read_bytes(UART_NUM_0, &ch, 1, pdMS_TO_TICKS(50));
         if (r == 1) {
@@ -707,8 +727,9 @@ static void uart_cli_task(void *arg)
                     } else if (!strcasecmp(sub, "rd")) {
                         char *ps = strtok(NULL, " \t");
                         char *rs = strtok(NULL, " \t");
-                        if (!ps || !rs) { write_line("\r\nUso: tlv rd <page> <reg>\r\n"); }
-                        else {
+                        if (!ps || !rs) {
+                            write_line("\r\nUso: tlv rd <page> <reg>\r\n");
+                        } else {
                             uint8_t p = parse_hex_byte(ps);
                             uint8_t r = parse_hex_byte(rs);
                             uint8_t v; esp_err_t e = tlv320_reg_read(p, r, &v);
@@ -769,6 +790,18 @@ static void uart_cli_task(void *arg)
                         write_line("\r\nHP vol set\r\n");
                     } else {
                         write_line("\r\nUso: vol <dac|hp> <L|R|both> <val>\r\n");
+                    }
+                } else if (!strcasecmp(cmd, "proto")) {
+                    char *sw = strtok(NULL, " \t");
+                    if (!sw) { write_line("\r\nUso: proto <on|off>\r\n"); }
+                    else if (!strcasecmp(sw, "on")) {
+                        bool ok = serial_proto_start(UART_NUM_0);
+                        write_line("\r\nPROTO %s\r\n", ok?"ON":"ERR");
+                    } else if (!strcasecmp(sw, "off")) {
+                        bool ok = serial_proto_stop();
+                        write_line("\r\nPROTO %s\r\n", ok?"OFF":"ERR");
+                    } else {
+                        write_line("\r\nUso: proto <on|off>\r\n");
                     }
                 } else {
                     // Tone and sweep commands

@@ -870,6 +870,53 @@ bool tlv320_configure_default(void)
     return true;
 }
 
+bool tlv320_configure_speaker_only(void)
+{
+    ESP_LOGI(TAG, "TLV320: Speaker-only (mono L+R sum -> Class-D), HP path off");
+
+    // Page 0: interface and clocks as usual (I2S 16-bit, slave)
+    tlv_write_ok(0x00, 0x1B, 0x00);
+    tlv_write_ok(0x00, 0x1C, 0x00);
+    tlv_write_ok(0x00, 0x1D, 0x01);
+    tlv_write_ok(0x00, 0x04, 0x07);
+    tlv_write_ok(0x00, 0x05, 0x91);
+    tlv_write_ok(0x00, 0x06, 0x08);
+    tlv_write_ok(0x00, 0x07, 0x00);
+    tlv_write_ok(0x00, 0x08, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    tlv_write_ok(0x00, 0x0B, 0x82);
+    tlv_write_ok(0x00, 0x0C, 0x81);
+    tlv_write_ok(0x00, 0x0D, 0x00);
+    tlv_write_ok(0x00, 0x0E, 0x80);
+    tlv_write_ok(0x00, 0x3C, 0x01); // PRB_P1
+    tlv_write_ok(0x00, 0x41, 0x00); // 0 dB
+    tlv_write_ok(0x00, 0x42, 0x00);
+    tlv_write_ok(0x00, 0x3F, 0xD4); // DACs on
+    tlv_write_ok(0x00, 0x40, 0x00); // unmute
+
+    // Page 1: power analog; keep HP off, route L+R into left analog mixer for Class-D
+    tlv_write_ok(0x01, 0x01, 0x08); // disable weak AVDD
+    tlv_write_ok(0x01, 0x02, 0x01); // master analog power on
+
+    // Feed analog mixers: set base routing LDAC->Left, RDAC->Right
+    tlv_write_ok(0x01, 0x21, 0x4C); // mix L = L+R summed (bit pattern per datasheet)
+
+    // Do NOT power HP drivers or route to HPL/HPR (speaker-only)
+    tlv_write_ok(0x01, 0x1F, 0x00); // HP drivers off
+    tlv_write_ok(0x01, 0x23, 0x00); // no HP routing
+
+    // Speaker path: connect speaker volume to left analog mixer and turn Class-D ON
+    tlv_write_ok(0x01, 0x26, 0x80); // SPK_VOL connected, 0 dB
+    tlv_write_ok(0x01, 0x20, 0x00); // toggle off
+    vTaskDelay(pdMS_TO_TICKS(5));
+    tlv_write_ok(0x01, 0x20, 0x80); // Class-D ON
+    tlv_write_ok(0x01, 0x2A, 0x04); // Unmute, low gain (~6 dB)
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ESP_LOGI(TAG, "Speaker-only listo: requiere 5V SPKVDD");
+    return true;
+}
+
 
 
 // 6dB

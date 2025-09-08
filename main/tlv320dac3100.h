@@ -43,6 +43,10 @@ bool tlv320_configure_dual_output(void);
 // Based on TLV320DAC3100 datasheet specifications for proper HP routing
 bool tlv320_configure_headphone_only(void);
 
+// Configure ONLY the Class-D speaker output (mono). Routes L+R summed into left analog path,
+// powers down HP drivers, and powers up Class-D. Requires 5V SPKVDD on the board.
+bool tlv320_configure_speaker_only(void);
+
 // Default baseline configuration: conservative, minimal setup to get audio out
 // of headphone outputs (HPL/HPR) using I2S 16-bit clocks from BCLK.
 // It programs Page 0 clocks (PLL from BCLK, NDAC/MDAC/DOSR), selects PRB_P1,
